@@ -9,7 +9,8 @@ from sqlalchemy import ColumnElement, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.dependencies import get_db, require_api_key
+from app.dependencies import get_db, get_metrics, require_api_key
+from app.metrics import ResultsMetrics
 from app.models import Result
 from app.schemas import ResultCreate, ResultList, ResultRead
 
@@ -28,7 +29,11 @@ MAX_BIGINT = 2**63 - 1
     response_model=ResultRead,
     dependencies=[Depends(require_api_key)],
 )
-def create_result(payload: ResultCreate, db: Session = Depends(get_db)) -> Result:
+def create_result(
+    payload: ResultCreate,
+    db: Session = Depends(get_db),
+    metrics: ResultsMetrics = Depends(get_metrics),
+) -> Result:
     """Store one result. The verdict is stored as sent; the API does not judge it."""
     # exclude_unset=True: fields the client did not send (e.g. "source") are left out of
     # the INSERT, so PostgreSQL applies its server-side default.
@@ -40,6 +45,8 @@ def create_result(payload: ResultCreate, db: Session = Depends(get_db)) -> Resul
     except SQLAlchemyError:
         db.rollback()
         raise
+    # Counted only here, after the commit succeeded.
+    metrics.result_stored(row.test_name, row.verdict)
     logger.info(
         "Result stored: id=%s %s %s %s",
         row.id, row.device_id, row.test_name, row.verdict,

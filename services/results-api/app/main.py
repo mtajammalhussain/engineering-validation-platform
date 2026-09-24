@@ -10,6 +10,8 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import InterfaceError, OperationalError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
@@ -17,7 +19,8 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from app.config import Settings, load_settings
 from app.db import create_db_engine, create_session_factory
 from app.logging_config import configure_logging
-from app.routers import results
+from app.metrics import REJECT_VALIDATION, setup_metrics
+from app.routers import health, results
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,17 @@ async def handle_unexpected_database_error(
     )
 
 
+async def handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Count rejected POST /api/v1/results bodies, then answer with FastAPI's normal 422.
+
+    Only the fixed label reason="validation" is recorded, never the invalid values.
+    Validation errors of other endpoints (e.g. GET query parameters) are not counted.
+    """
+    if request.scope.get("endpoint") is results.create_result:
+        request.app.state.metrics.result_rejected(REJECT_VALIDATION)
+    return await request_validation_exception_handler(request, exc)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Build the FastAPI application.
 
@@ -81,8 +95,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="EVP Results API", lifespan=lifespan)
     app.state.settings = settings
+    app.state.metrics = setup_metrics(app)  # also adds GET /metrics
     for error_class in DATABASE_UNAVAILABLE_ERRORS:
         app.add_exception_handler(error_class, handle_database_unavailable)
     app.add_exception_handler(SQLAlchemyError, handle_unexpected_database_error)
+    app.add_exception_handler(RequestValidationError, handle_validation_error)
+    app.include_router(health.router)
     app.include_router(results.router)
     return app

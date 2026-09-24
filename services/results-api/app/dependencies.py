@@ -13,6 +13,7 @@ from fastapi.security import APIKeyHeader
 from sqlalchemy.orm import Session
 
 from app.config import Settings
+from app.metrics import REJECT_AUTH, ResultsMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,10 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 def get_settings(request: Request) -> Settings:
     return request.app.state.settings
+
+
+def get_metrics(request: Request) -> ResultsMetrics:
+    return request.app.state.metrics
 
 
 def get_db(request: Request) -> Iterator[Session]:
@@ -37,6 +42,7 @@ def get_db(request: Request) -> Iterator[Session]:
 def require_api_key(
     api_key: str | None = Security(api_key_header),
     settings: Settings = Depends(get_settings),
+    metrics: ResultsMetrics = Depends(get_metrics),
 ) -> None:
     """Reject the request with 401 unless the X-API-Key header matches RESULTS_API_KEY.
 
@@ -48,6 +54,7 @@ def require_api_key(
     if api_key is None or not secrets.compare_digest(api_key.encode("utf-8"), expected):
         reason = "missing" if api_key is None else "invalid"
         logger.warning("Rejected request: %s API key", reason)
+        metrics.result_rejected(REJECT_AUTH)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API key"
         )

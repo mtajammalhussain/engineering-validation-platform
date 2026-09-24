@@ -55,7 +55,7 @@ def test_normal_string_representation_masks_password():
         assert "***" in text
 
 
-def test_engine_uses_pool_pre_ping(monkeypatch):
+def test_engine_uses_pool_pre_ping_and_connect_timeout(monkeypatch):
     captured = {}
 
     def fake_create_engine(url, **kwargs):
@@ -68,6 +68,8 @@ def test_engine_uses_pool_pre_ping(monkeypatch):
 
     assert engine == "fake-engine"
     assert captured["kwargs"]["pool_pre_ping"] is True
+    assert captured["kwargs"]["connect_args"] == {"connect_timeout": app.db.DB_CONNECT_TIMEOUT_S}
+    assert 0 < app.db.DB_CONNECT_TIMEOUT_S <= 5
     assert captured["url"].password == SPECIAL_PASSWORD
 
 
