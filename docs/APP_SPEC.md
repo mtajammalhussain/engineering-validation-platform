@@ -218,12 +218,14 @@ Validation (only data-quality checks, **no** limit logic) → `422` with a clear
 - Unknown fields are rejected (`extra = "forbid"`).
 
 Response `201`: the stored result including `id` and `received_at`.
-Errors: `401` missing/invalid API key, `422` validation, `503` database unavailable.
+Errors: `401` missing/invalid API key, `422` validation, `503` database unavailable,
+`500` unexpected server/database error (generic body; details are logged server-side only).
 
 ### 5.3 `GET /api/v1/results`
 
 Query params: `device_id`, `test_name`, `verdict`, `from`, `to` (ISO 8601, tz-aware),
 `limit` (default 50, max 500), `offset` (default 0). Sorted by `started_at` descending.
+Time window: `from` is inclusive, `to` is exclusive (`from <= started_at < to`).
 Response: `{"items": [...], "total": <int>, "limit": 50, "offset": 0}`.
 
 Example: all failed Sleep Current tests of ECU-004:
@@ -251,7 +253,8 @@ Example: all failed Sleep Current tests of ECU-004:
 Works with a **database user that only has SELECT** privileges. No writes, no migrations.
 
 Common query params: `from`, `to` (tz-aware ISO 8601; default: last 7 days), optional
-`device_id`, `test_name`.
+`device_id`, `test_name`. Time windows use the same semantics as §5.3: `from` is inclusive,
+`to` is exclusive (`from <= started_at < to`).
 
 `pass_rate_percent` = `passed / total * 100`, rounded to 1 decimal. **If `total == 0` it is `null`.**
 
