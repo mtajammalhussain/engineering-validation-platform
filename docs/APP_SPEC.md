@@ -154,8 +154,8 @@ One table: **`test_results`**
 | `verdict` | `text` not null, check in (`PASS`,`FAIL`) | **decided by the bench** |
 | `started_at` | `timestamptz` not null | from the bench |
 | `duration_s` | `double precision` not null | |
-| `received_at` | `timestamptz` default `now()` | set by the server |
-| `source` | `text` default `'simulator'` | which bench sent it |
+| `received_at` | `timestamptz` not null default `now()` | set by the server |
+| `source` | `text` not null default `'simulator'` | which bench sent it |
 
 Indexes: `started_at`, `device_id`, `test_name`, `verdict`.
 
