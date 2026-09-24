@@ -113,9 +113,13 @@ These rules make the application run on Kubernetes without rework.
 engineering-validation-platform/
 ├── services/                      # application layer
 │   ├── results-api/
-│   │   ├── app/ (main.py, config.py, db.py, models.py, schemas.py, metrics.py, logging_config.py, routers/results.py)
-│   │   ├── migrations/            # Alembic
-│   │   ├── tests/unit/  tests/integration/
+│   │   ├── app/ (main.py, config.py, db.py, dependencies.py, models.py, schemas.py,
+│   │   │         metrics.py, logging_config.py, routers/results.py, routers/health.py)
+│   │   ├── migrations/            # Alembic (env.py, versions/)
+│   │   ├── alembic.ini            # no database URL or credentials
+│   │   ├── tests/unit/            # no database: conftest.py, fakes.py, test_*.py
+│   │   │                          #   (incl. test_integration_guard.py)
+│   │   ├── tests/integration/     # real PostgreSQL: conftest.py, support.py, test_*.py
 │   │   ├── requirements.txt  requirements-dev.txt  setup.cfg  README.md
 │   ├── reporting-api/             # same structure, no migrations
 │   └── simulator/
