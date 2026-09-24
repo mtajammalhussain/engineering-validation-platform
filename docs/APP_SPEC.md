@@ -208,12 +208,12 @@ Request:
 
 Validation (only data-quality checks, **no** limit logic) → `422` with a clear message:
 
-- `device_id` matches `^ECU-\d{3}$`.
+- `device_id` matches `^ECU-[0-9]{3}$`.
 - `test_name` 1–100 characters; `unit` 1–10 characters.
 - `temperature_c` between −40 and 125 inclusive.
 - `measured_value`, `limit_min`, `limit_max`: finite numbers (limits optional).
 - `verdict` is exactly `PASS` or `FAIL`.
-- `duration_s` > 0.
+- `duration_s`: finite number > 0.
 - `started_at` must be timezone-aware (naive timestamps rejected) and not more than 5 minutes in the future.
 - Unknown fields are rejected (`extra = "forbid"`).
 
