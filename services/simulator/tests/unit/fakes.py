@@ -2,6 +2,7 @@
 
 import logging
 import os
+import signal
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -112,3 +113,14 @@ def preserved_logger_state() -> Iterator[None]:
             lg.handlers[:] = handlers
             lg.setLevel(level)
             lg.propagate = propagate
+
+
+@contextmanager
+def preserved_signal_handlers() -> Iterator[None]:
+    """Restore the SIGTERM/SIGINT handlers afterwards (signal handlers are process-wide)."""
+    saved = {signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        yield
+    finally:
+        for signum, handler in saved.items():
+            signal.signal(signum, signal.SIG_DFL if handler is None else handler)
