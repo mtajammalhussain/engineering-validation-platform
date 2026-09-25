@@ -1,0 +1,5 @@
+# Runtime dependencies of reporting-api (exact versions, see docs/APP_SPEC.md §11).
+# Same pins as results-api. No alembic: the Reporting API never runs migrations.
+pydantic-settings==2.15.0
+SQLAlchemy==2.0.54
+psycopg2-binary==2.9.13
