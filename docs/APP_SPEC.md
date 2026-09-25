@@ -121,7 +121,9 @@ engineering-validation-platform/
 │   │   │                          #   (incl. test_integration_guard.py)
 │   │   ├── tests/integration/     # real PostgreSQL: conftest.py, support.py, test_*.py
 │   │   ├── requirements.txt  requirements-dev.txt  setup.cfg  README.md
-│   ├── reporting-api/             # same structure, no migrations
+│   ├── reporting-api/             # same structure, but: no migrations/ or alembic.ini;
+│   │                              #   models.py only describes the read-only table;
+│   │                              #   adds calculations.py, queries.py, routers/reports.py
 │   └── simulator/
 │       ├── simulator/ (main.py, config.py, catalog.py, verdict.py, generator.py, client.py, output.py)
 │       ├── tests/unit/
@@ -254,22 +256,71 @@ Example: all failed Sleep Current tests of ECU-004:
 
 ## 7. Reporting API (`reporting-api`)
 
-Works with a **database user that only has SELECT** privileges. No writes, no migrations.
+Works with a **database user that only has SELECT** privileges. No writes, no migrations. The
+`test_results` table (§4) is owned by the Results API and its Alembic migrations; the Reporting API
+only reads it.
 
-Common query params: `from`, `to` (tz-aware ISO 8601; default: last 7 days), optional
-`device_id`, `test_name`. Time windows use the same semantics as §5.3: `from` is inclusive,
-`to` is exclusive (`from <= started_at < to`).
+**Read-only by design (defence in depth):** Reporting API connections default to read-only
+transactions (`default_transaction_read_only=on`). This protects against accidental writes by
+ordinary application code, but it is only a transaction default and can be overridden by a
+session. The SELECT-only PostgreSQL role remains the actual security boundary required for M2
+acceptance (§12).
 
-`pass_rate_percent` = `passed / total * 100`, rounded to 1 decimal. **If `total == 0` it is `null`.**
+### 7.1 Common query parameters and report window
+
+| Param | Rule |
+|---|---|
+| `from`, `to` | Optional. Timezone-aware ISO 8601; naive timestamps → `422` |
+| `device_id`, `test_name` | Optional exact-match filters, accepted by every report endpoint (also by `by-device` and `by-test`). No format check; an unknown value gives an empty result |
+
+Time windows use the same semantics as §5.3: `from` is inclusive, `to` is exclusive
+(`from <= started_at < to`). The default is a **rolling** seven-day window (exact times, not aligned
+to calendar days); `now` is the request time in UTC:
+
+| Given | Effective window |
+|---|---|
+| neither | `[now - 7 days, now)` |
+| only `from` | `[from, now)` |
+| only `to` | `[to - 7 days, to)` |
+| both | `[from, to)` |
+
+If the effective `from >= to` → `422`.
+
+Every report response returns the effective `from` and `to` as timezone-aware **UTC** values
+(`...Z`), also when the client sent another offset (e.g. `+02:00`).
+
+### 7.2 Pass rate
+
+`pass_rate_percent` = `passed / total * 100`, rounded to 1 decimal with **half-up** rounding
+(`ROUND_HALF_UP`, computed exactly in decimal, not with binary floats; e.g. `6.25` → `6.3`).
+**If `total == 0` it is `null`.**
+
+### 7.3 Endpoints
 
 | Method | Path | Response |
 |---|---|---|
 | `GET` | `/api/v1/reports/summary` | `{"from","to","total","passed","failed","pass_rate_percent"}` |
-| `GET` | `/api/v1/reports/by-device` | list of `{device_id,total,passed,failed,pass_rate_percent}`, sorted by `failed` desc |
-| `GET` | `/api/v1/reports/by-test` | same, keyed by `test_name` |
-| `GET` | `/api/v1/reports/timeseries?interval=hour\|day` | list of `{bucket_start,total,passed,failed}` |
+| `GET` | `/api/v1/reports/by-device` | `{"from","to","items"}`; each item `{device_id,total,passed,failed,pass_rate_percent}`; sorted by `failed` desc, then `device_id` asc |
+| `GET` | `/api/v1/reports/by-test` | same, keyed by `test_name`; sorted by `failed` desc, then `test_name` asc |
+| `GET` | `/api/v1/reports/timeseries?interval=hour\|day` | `{"from","to","items"}`; each item `{bucket_start,total,passed,failed}`; sorted by `bucket_start` asc |
 | `GET` | `/health`, `/ready`, `/metrics` | see §2 |
 | `GET` | `/docs` | Swagger UI |
+
+- Grouped reports and timeseries return only groups/buckets that contain at least one result, so
+  `items` may be `[]`. A `null` pass rate therefore only occurs in `summary`.
+- `interval` is **required** and must be `hour` or `day`; otherwise `422`.
+- Timeseries buckets are computed in **UTC** (`date_trunc(<interval>, started_at, 'UTC')`),
+  independent of the database session's time zone. `bucket_start` is a timezone-aware UTC value.
+- Empty buckets are **not** zero-filled. The first and last bucket may be partial when `from`/`to`
+  do not fall on a bucket boundary (so `bucket_start` can be earlier than `from`).
+
+Errors:
+
+- `422` for invalid report parameters, including naive timestamps, `from >= to`, and missing or
+  invalid `interval`;
+- `503` when the database is unavailable;
+- `500` for other unexpected server/database errors, with a generic response body; details are
+  logged server-side only.
 
 Example summary:
 
@@ -277,7 +328,20 @@ Example summary:
 {"from":"2026-09-16T00:00:00Z","to":"2026-09-23T00:00:00Z","total":1250,"passed":1182,"failed":68,"pass_rate_percent":94.6}
 ```
 
+Example by-device:
+
+```json
+{"from":"2026-09-16T00:00:00Z","to":"2026-09-23T00:00:00Z","items":[{"device_id":"ECU-002","total":64,"passed":58,"failed":6,"pass_rate_percent":90.6},{"device_id":"ECU-001","total":61,"passed":61,"failed":0,"pass_rate_percent":100.0}]}
+```
+
 Aggregations are done **in SQL** (`COUNT`, `FILTER`, `GROUP BY`, `date_trunc`), not in Python loops.
+The service never fetches raw result rows for a report: PostgreSQL returns one row per summary,
+group or bucket, and Python only derives `pass_rate_percent` from those aggregated counts.
+
+### 7.4 Metrics
+
+Standard HTTP metrics only (request count, latency and status codes per route, e.g.
+`prometheus-fastapi-instrumentator`). There are no Reporting-specific custom counters.
 
 No CORS configuration is needed (there is no browser frontend).
 
