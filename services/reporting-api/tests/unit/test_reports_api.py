@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.dialects import postgresql
 
 import app.main
 import app.routers.reports
@@ -308,3 +309,234 @@ def test_summary_needs_no_api_key_and_other_methods_are_not_allowed(client, sess
     assert client.get(URL).status_code == 200
     for method in ("post", "put", "delete"):
         assert getattr(client, method)(URL).status_code == 405
+
+
+# === by-device / by-test ====================================================================
+
+BY_DEVICE = "/api/v1/reports/by-device"
+BY_TEST = "/api/v1/reports/by-test"
+GROUPED = [(BY_DEVICE, "device_id"), (BY_TEST, "test_name")]
+
+
+def group_row(key: str, value: str, total: int, passed: int, failed: int):
+    return SimpleNamespace(**{key: value}, total=total, passed=passed, failed=failed)
+
+
+@pytest.mark.parametrize("url, key", GROUPED)
+def test_grouped_report_maps_rows_in_database_order(client, session, url, key):
+    # Rows as PostgreSQL returns them: failed DESC, then key ASC. The API keeps that order.
+    session.rows = [
+        group_row(key, "B", 120, 111, 9),
+        group_row(key, "A", 5, 3, 2),
+        group_row(key, "C", 5, 3, 2),
+        group_row(key, "D", 4, 4, 0),
+    ]
+    params = {"from": "2026-09-16T00:00:00Z", "to": "2026-09-23T00:00:00Z"}
+
+    response = client.get(url, params=params)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert list(body) == ["from", "to", "items"]
+    assert (body["from"], body["to"]) == ("2026-09-16T00:00:00Z", "2026-09-23T00:00:00Z")
+    assert body["items"][0] == {
+        key: "B", "total": 120, "passed": 111, "failed": 9, "pass_rate_percent": 92.5,
+    }
+    assert [item[key] for item in body["items"]] == ["B", "A", "C", "D"]
+    assert [item["pass_rate_percent"] for item in body["items"]] == [92.5, 60.0, 60.0, 100.0]
+    assert session.closed
+
+
+@pytest.mark.parametrize("url, key", GROUPED)
+def test_grouped_report_asks_the_database_for_failed_desc_then_key_asc(client, session, url, key):
+    client.get(url)
+
+    (statement,) = session.statements
+    sql = str(statement.compile(dialect=postgresql.dialect()))
+    assert f"GROUP BY test_results.{key} ORDER BY failed DESC, test_results.{key} ASC" in sql
+
+
+@pytest.mark.parametrize("url, key", GROUPED)
+def test_grouped_report_without_rows_returns_empty_items(client, session, url, key):
+    response = client.get(url, params={key: "unknown"})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "from": "2026-09-18T10:00:00Z", "to": "2026-09-25T10:00:00Z", "items": [],
+    }
+
+
+@pytest.mark.parametrize("url, key", GROUPED)
+def test_grouped_report_passes_both_filters_to_the_query(client, session, url, key):
+    client.get(url, params={"device_id": "ECU-004", "test_name": "Sleep Current"})
+
+    assert where(session) == [
+        ("started_at", operator.ge, NOW - timedelta(hours=168)),
+        ("started_at", operator.lt, NOW),
+        ("device_id", operator.eq, "ECU-004"),
+        ("test_name", operator.eq, "Sleep Current"),
+    ]
+
+
+@pytest.mark.parametrize("url, key", GROUPED)
+def test_grouped_report_normalises_offsets_to_utc(client, session, url, key):
+    body = client.get(url, params={"from": "2026-09-20T12:00:00+02:00"}).json()
+
+    assert (body["from"], body["to"]) == ("2026-09-20T10:00:00Z", "2026-09-25T10:00:00Z")
+    assert window(session) == (datetime(2026, 9, 20, 10, tzinfo=timezone.utc), NOW)
+
+
+@pytest.mark.parametrize("url, key", GROUPED)
+def test_grouped_report_rejects_invalid_window(client, session, url, key):
+    params = {"from": "2026-09-21T00:00:00Z", "to": "2026-09-20T00:00:00Z"}
+
+    response = client.get(url, params=params)
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "from must be earlier than to"}
+    assert session.statements == []
+
+
+# === timeseries =============================================================================
+
+TIMESERIES = "/api/v1/reports/timeseries"
+
+
+def bucket_row(bucket_start: datetime, total: int, passed: int, failed: int):
+    return SimpleNamespace(bucket_start=bucket_start, total=total, passed=passed, failed=failed)
+
+
+def test_timeseries_requires_interval(client, session):
+    response = client.get(TIMESERIES)
+
+    assert response.status_code == 422
+    (error,) = response.json()["detail"]
+    assert error["loc"] == ["query", "interval"]
+    assert error["type"] == "missing"
+    assert session.statements == []
+
+
+@pytest.mark.parametrize("interval", ["hour", "day"])
+def test_timeseries_accepts_hour_and_day(client, session, interval):
+    response = client.get(TIMESERIES, params={"interval": interval})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "from": "2026-09-18T10:00:00Z", "to": "2026-09-25T10:00:00Z", "items": [],
+    }
+    (statement,) = session.statements
+    assert interval in statement.compile(dialect=postgresql.dialect()).params.values()
+
+
+@pytest.mark.parametrize("interval", ["minute", "HOUR", "week", "", "hour'; DROP TABLE x;--"])
+def test_timeseries_rejects_other_intervals(client, session, interval):
+    response = client.get(TIMESERIES, params={"interval": interval})
+
+    assert response.status_code == 422
+    assert session.statements == []
+
+
+def test_timeseries_maps_bucket_rows(client, session):
+    session.rows = [
+        bucket_row(datetime(2026, 9, 16, 10, tzinfo=timezone.utc), 15, 14, 1),
+        bucket_row(datetime(2026, 9, 16, 12, tzinfo=timezone.utc), 3, 3, 0),
+    ]
+    params = {"interval": "hour", "from": "2026-09-16T00:00:00Z", "to": "2026-09-23T00:00:00Z"}
+
+    body = client.get(TIMESERIES, params=params).json()
+
+    assert body == {
+        "from": "2026-09-16T00:00:00Z",
+        "to": "2026-09-23T00:00:00Z",
+        "items": [
+            {"bucket_start": "2026-09-16T10:00:00Z", "total": 15, "passed": 14, "failed": 1},
+            {"bucket_start": "2026-09-16T12:00:00Z", "total": 3, "passed": 3, "failed": 0},
+        ],
+    }
+    # Only buckets returned by the database; the missing 11:00 bucket is not invented.
+    assert "pass_rate_percent" not in body["items"][0]
+
+
+def test_timeseries_bucket_start_with_other_offset_is_shown_in_utc(client, session):
+    plus_2 = timezone(timedelta(hours=2))
+    session.rows = [bucket_row(datetime(2026, 9, 20, 12, 0, tzinfo=plus_2), 1, 1, 0)]
+
+    body = client.get(TIMESERIES, params={"interval": "hour"}).json()
+
+    assert body["items"][0]["bucket_start"] == "2026-09-20T10:00:00Z"
+
+
+def test_timeseries_bucket_may_start_before_from(client, session):
+    # from=10:37, results at 10:45 and 10:50 -> PostgreSQL returns the 10:00 bucket.
+    session.rows = [bucket_row(datetime(2026, 9, 20, 10, 0, tzinfo=timezone.utc), 2, 2, 0)]
+    params = {"interval": "hour", "from": "2026-09-20T10:37:00Z", "to": "2026-09-20T11:00:00Z"}
+
+    body = client.get(TIMESERIES, params=params).json()
+
+    assert body["from"] == "2026-09-20T10:37:00Z"
+    assert body["items"] == [
+        {"bucket_start": "2026-09-20T10:00:00Z", "total": 2, "passed": 2, "failed": 0},
+    ]
+    assert window(session)[0] == datetime(2026, 9, 20, 10, 37, tzinfo=timezone.utc)
+
+
+def test_timeseries_passes_window_and_filters_to_the_query(client, session):
+    params = {"interval": "day", "from": "2026-09-20T12:00:00+02:00",
+              "device_id": "ECU-004", "test_name": "Sleep Current"}
+
+    body = client.get(TIMESERIES, params=params).json()
+
+    assert body["from"] == "2026-09-20T10:00:00Z"
+    assert where(session) == [
+        ("started_at", operator.ge, datetime(2026, 9, 20, 10, tzinfo=timezone.utc)),
+        ("started_at", operator.lt, NOW),
+        ("device_id", operator.eq, "ECU-004"),
+        ("test_name", operator.eq, "Sleep Current"),
+    ]
+
+
+def test_timeseries_rejects_invalid_window(client, session):
+    params = {"interval": "hour", "from": "2026-09-20T00:00:00Z", "to": "2026-09-20T00:00:00Z"}
+
+    response = client.get(TIMESERIES, params=params)
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "from must be earlier than to"}
+
+
+# === shared behaviour of the new report endpoints =============================================
+
+NEW_REPORTS = [BY_DEVICE, BY_TEST, TIMESERIES + "?interval=hour"]
+
+
+@pytest.mark.parametrize("url", NEW_REPORTS)
+@pytest.mark.parametrize("make_error", UNAVAILABLE_ERRORS.values(), ids=UNAVAILABLE_ERRORS.keys())
+def test_new_reports_database_unavailable_returns_503(client, session, url, make_error):
+    session.error = make_error()
+
+    response = client.get(url)
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Database unavailable"}
+    assert session.closed
+
+
+@pytest.mark.parametrize("url", NEW_REPORTS)
+@pytest.mark.parametrize("make_error", UNEXPECTED_ERRORS.values(), ids=UNEXPECTED_ERRORS.keys())
+def test_new_reports_other_database_errors_return_500(client, session, url, make_error):
+    session.error = make_error()
+
+    response = client.get(url)
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal server error"}
+    for marker in LEAK_MARKERS:
+        assert marker not in response.text
+    assert session.closed
+
+
+@pytest.mark.parametrize("url", NEW_REPORTS)
+def test_new_reports_need_no_api_key_and_only_allow_get(client, url):
+    assert client.get(url).status_code == 200
+    for method in ("post", "put", "delete"):
+        assert getattr(client, method)(url).status_code == 405

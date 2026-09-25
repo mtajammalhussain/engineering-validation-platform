@@ -389,10 +389,18 @@ def test_swagger_ui_is_enabled(client):
     assert "swagger" in response.text.lower()
 
 
-def test_openapi_lists_only_operational_routes_and_no_security(client):
+def test_openapi_lists_exactly_the_expected_routes_and_no_security(client):
     spec = client.get("/openapi.json").json()
 
-    assert set(spec["paths"]) == {"/health", "/ready", "/metrics", "/api/v1/reports/summary"}
+    assert set(spec["paths"]) == {
+        "/health",
+        "/ready",
+        "/metrics",
+        "/api/v1/reports/summary",
+        "/api/v1/reports/by-device",
+        "/api/v1/reports/by-test",
+        "/api/v1/reports/timeseries",
+    }
     assert "securitySchemes" not in spec.get("components", {})
     assert all("security" not in op for path in spec["paths"].values() for op in path.values())
 

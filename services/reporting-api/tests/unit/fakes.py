@@ -42,23 +42,28 @@ LEAK_MARKERS = ("db.example.invalid", "SELECT", "test_results", "low-level detai
 
 
 class FakeResult:
-    """Result of one aggregate query: offers only ``.one()``.
+    """Result of one aggregate query: ``.one()`` for summary, ``.all()`` for groups/buckets.
 
-    There is deliberately no ``.all()``, ``.scalars()`` or iteration, so code that tried to
-    fetch individual result rows (and count them in Python) would fail a test.
+    Both return rows prepared by the test, i.e. already-aggregated counts. There is no
+    ``.scalars()`` or iteration over individual test results.
     """
 
-    def __init__(self, row) -> None:
+    def __init__(self, row, rows) -> None:
         self._row = row
+        self._rows = rows
 
     def one(self):
         return self._row
+
+    def all(self):
+        return list(self._rows)
 
 
 class FakeSession:
     """Stands in for a SQLAlchemy Session (read-only use) and records every call.
 
-    ``row`` is what an aggregate query returns (e.g. total/passed/failed counts).
+    ``row`` is what the summary query returns (total/passed/failed counts); ``rows`` is
+    what a grouped or time-bucket query returns (one aggregate row per group/bucket).
     """
 
     def __init__(self) -> None:
@@ -66,12 +71,13 @@ class FakeSession:
         self.closed = False
         self.error: SQLAlchemyError | None = None
         self.row = SimpleNamespace(total=0, passed=0, failed=0)
+        self.rows: list = []
 
     def execute(self, statement):
         self.statements.append(statement)
         if self.error is not None:
             raise self.error
-        return FakeResult(self.row)
+        return FakeResult(self.row, self.rows)
 
     def close(self) -> None:
         self.closed = True
