@@ -1,10 +1,16 @@
 """Shared test helpers. No network, no database, no external services."""
 
+import logging
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import httpx
 
+from simulator.catalog import TestSpec
 from simulator.config import Settings
+from simulator.generator import GeneratedResult
+from simulator.logging_config import RESULTS_LOGGER
 
 API_URL = "http://results-api:8001"
 API_KEY = "super-secret-key"
@@ -69,3 +75,40 @@ class RecordingWait:
     def __call__(self, delay_seconds: float) -> bool:
         self.delays.append(delay_seconds)
         return self._answers.pop(0) if self._answers else False
+
+
+def make_generated(
+    spec: TestSpec, device_id: str, temperature_c: int, measured_value: float, verdict: str
+) -> GeneratedResult:
+    """A GeneratedResult with chosen values (the verdict is taken as given, not evaluated)."""
+    return GeneratedResult(spec=spec, payload={
+        "device_id": device_id,
+        "test_name": spec.test_name,
+        "temperature_c": temperature_c,
+        "measured_value": measured_value,
+        "unit": spec.unit,
+        "limit_min": spec.limit_min,
+        "limit_max": spec.limit_max,
+        "verdict": verdict,
+        "started_at": "2026-09-25T10:00:00+00:00",
+        "duration_s": 42.0,
+        "source": "simulator",
+    })
+
+
+@contextmanager
+def preserved_logger_state() -> Iterator[None]:
+    """Restore handlers, level and propagate of every logger configure_logging() changes.
+
+    Needed because logging is global: a handler left on ``simulator.results`` would keep
+    writing to a closed pytest capture stream in later tests.
+    """
+    loggers = [logging.getLogger(name) for name in (None, RESULTS_LOGGER, "httpx", "httpcore")]
+    saved = [(lg, lg.handlers[:], lg.level, lg.propagate) for lg in loggers]
+    try:
+        yield
+    finally:
+        for lg, handlers, level, propagate in saved:
+            lg.handlers[:] = handlers
+            lg.setLevel(level)
+            lg.propagate = propagate
