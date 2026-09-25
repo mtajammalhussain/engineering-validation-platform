@@ -18,7 +18,7 @@ from app.config import Settings, load_settings
 from app.db import create_db_engine, create_session_factory
 from app.logging_config import configure_logging
 from app.metrics import setup_metrics
-from app.routers import health
+from app.routers import health, reports
 
 logger = logging.getLogger(__name__)
 
@@ -88,4 +88,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.add_exception_handler(error_class, handle_database_unavailable)
     app.add_exception_handler(SQLAlchemyError, handle_unexpected_database_error)
     app.include_router(health.router)
+    app.include_router(reports.router)
     return app

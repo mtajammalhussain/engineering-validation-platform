@@ -6,6 +6,8 @@ It deliberately has no add/commit/refresh methods: the Reporting API never write
 attempt to write would fail a test with AttributeError.
 """
 
+from types import SimpleNamespace
+
 from sqlalchemy.exc import (
     DataError,
     IntegrityError,
@@ -39,18 +41,37 @@ LEAK_MARKERS = ("db.example.invalid", "SELECT", "test_results", "low-level detai
                 "super-secret-password", "QueuePool")
 
 
+class FakeResult:
+    """Result of one aggregate query: offers only ``.one()``.
+
+    There is deliberately no ``.all()``, ``.scalars()`` or iteration, so code that tried to
+    fetch individual result rows (and count them in Python) would fail a test.
+    """
+
+    def __init__(self, row) -> None:
+        self._row = row
+
+    def one(self):
+        return self._row
+
+
 class FakeSession:
-    """Stands in for a SQLAlchemy Session (read-only use) and records every call."""
+    """Stands in for a SQLAlchemy Session (read-only use) and records every call.
+
+    ``row`` is what an aggregate query returns (e.g. total/passed/failed counts).
+    """
 
     def __init__(self) -> None:
         self.statements: list = []
         self.closed = False
         self.error: SQLAlchemyError | None = None
+        self.row = SimpleNamespace(total=0, passed=0, failed=0)
 
     def execute(self, statement):
         self.statements.append(statement)
         if self.error is not None:
             raise self.error
+        return FakeResult(self.row)
 
     def close(self) -> None:
         self.closed = True
