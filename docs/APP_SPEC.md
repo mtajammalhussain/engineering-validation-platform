@@ -96,9 +96,17 @@ These rules make the application run on Kubernetes without rework.
 4. **Logs to stdout**, never to files. Secrets are never logged. Format selectable (see §9).
 5. **Health endpoints** on every API (not under `/api/v1`):
    - `GET /health` → `200 {"status":"ok"}` if the process is alive (liveness). No DB access.
-   - `GET /ready` → `200` if the DB answers `SELECT 1`, otherwise `503` (readiness).
-6. **Metrics:** `GET /metrics` in Prometheus text format on every API.
+   - `GET /ready` → `200` if the database can serve this API's requests, otherwise `503`
+     (readiness). Results API: the DB answers `SELECT 1`. Reporting API: the DB answers
+     `SELECT 1 FROM test_results LIMIT 0`, which proves that the table exists and that the
+     database user may read it, without reading any rows.
+6. **Metrics:** `GET /metrics` in Prometheus text format on every API. Metrics live in the memory
+   of the process, so each API runs **exactly one uvicorn worker process per container** and
+   scales by running more containers (replicas), never with uvicorn `--workers`.
 7. **Migrations are a separate command** (`alembic upgrade head`), **never** run on app startup.
+   The migration command needs only the database settings (`DB_*`) and the logging settings
+   (`APP_ENV`, `LOG_LEVEL`, `LOG_FORMAT`); runtime-only settings such as `PORT` and
+   `RESULTS_API_KEY` are not required.
 8. **Graceful shutdown** on SIGTERM (uvicorn default for APIs; the simulator handles it in loop mode).
 9. **Build once, deploy everywhere.** The same image runs in dev and prod; only env vars differ.
 10. **Unique URL prefixes** so an Ingress can route by path:
@@ -220,30 +228,63 @@ Request:
 }
 ```
 
-Validation (only data-quality checks, **no** limit logic) → `422` with a clear message:
+Validation (only data-quality checks; the API never compares `measured_value` with the limits
+and never recalculates or changes the verdict) → `422` with a clear message:
 
 - `device_id` matches `^ECU-[0-9]{3}$`.
 - `test_name` 1–100 characters; `unit` 1–10 characters.
 - `temperature_c` between −40 and 125 inclusive.
 - `measured_value`, `limit_min`, `limit_max`: finite numbers (limits optional).
+- If **both** limits are given, `limit_min` must not be greater than `limit_max`
+  (`limit_min == limit_max` is valid). Only one limit or no limit is also valid. This only
+  checks that the reported limits are consistent with each other.
 - `verdict` is exactly `PASS` or `FAIL`.
 - `duration_s`: finite number > 0.
-- `started_at` must be timezone-aware (naive timestamps rejected) and not more than 5 minutes in the future.
+- `started_at` must be timezone-aware (naive timestamps rejected), representable as a UTC
+  timestamp (after conversion to UTC it must lie within the years 1–9999; e.g.
+  `0001-01-01T00:00:00+01:00` is rejected), and not more than 5 minutes in the future.
+- `source` is optional. If omitted, the database stores `'simulator'`. If sent, it must be
+  1–100 characters and must not consist only of whitespace; it is stored exactly as sent (no
+  trimming). `null` is rejected.
 - Unknown fields are rejected (`extra = "forbid"`).
 
 Response `201`: the stored result including `id` and `received_at`.
 Errors: `401` missing/invalid API key, `422` validation, `503` database unavailable,
-`500` unexpected server/database error (generic body; details are logged server-side only).
+`500` any other unexpected server/database error, with the generic body
+`{"detail":"Internal server error"}` (details are logged server-side only, never returned).
+
+**Storing a result.** The row is inserted and its database-generated values (`id`,
+`received_at`, default `source`) are read back inside the same transaction; the commit is the
+**last** database step. After a successful commit only in-memory work remains (metrics, log
+line, response), so a stored result is not turned into an error response by later database
+work. Residual risk: if the connection fails while the commit itself is being confirmed, the
+database may have stored the row although the client receives `503`; a client that retries
+`5xx` responses can then store the result twice. Only request idempotency, which is not part of
+this API, would remove this case.
 
 ### 5.3 `GET /api/v1/results`
 
 Query params: `device_id`, `test_name`, `verdict`, `from`, `to` (ISO 8601, tz-aware),
 `limit` (default 50, max 500), `offset` (default 0). Sorted by `started_at` descending.
-Time window: `from` is inclusive, `to` is exclusive (`from <= started_at < to`).
+Time window: `from` is inclusive, `to` is exclusive (`from <= started_at < to`). Each bound is
+optional. If both are given, `from` must be earlier than `to`; `from >= to` → `422`
+`{"detail":"from must be earlier than to"}` (the same rule as the Reporting API, §7.1).
 Response: `{"items": [...], "total": <int>, "limit": 50, "offset": 0}`.
 
 Example: all failed Sleep Current tests of ECU-004:
 `GET /api/v1/results?device_id=ECU-004&test_name=Sleep%20Current&verdict=FAIL`
+
+`GET /api/v1/results/{id}` returns one stored result.
+
+Errors of both `GET` endpoints:
+
+- `404` `{"detail":"Result not found"}` for an unknown `id`;
+- `422` for invalid query or path parameters: naive or malformed `from`/`to`, `from >= to`,
+  invalid `verdict`, `limit` outside 1–500, negative `offset`, `offset` or `id` above the
+  PostgreSQL `bigint` maximum, `id` not a positive integer;
+- `503` `{"detail":"Database unavailable"}` when the database cannot be reached or used;
+- `500` `{"detail":"Internal server error"}` for any other unexpected error (details are logged
+  server-side only).
 
 ### 5.4 Metrics (in addition to standard HTTP metrics)
 
@@ -251,6 +292,11 @@ Example: all failed Sleep Current tests of ECU-004:
   "results per minute" and "PASS/FAIL rate" panels
 - `evp_results_rejected_total{reason}` (counter; e.g. `validation`, `auth`)
 - HTTP request count, latency and status codes per route (e.g. `prometheus-fastapi-instrumentator`)
+
+**Label cardinality (accepted risk).** `test_name` is a value chosen by the client (1–100
+characters), so the API does not bound the number of `test_name` label values. This is accepted:
+only clients holding the write API key can create new values, and a value is recorded only
+after a result has been stored. There is no allow-list and no mapping of unknown names.
 
 ---
 
@@ -274,6 +320,11 @@ ordinary application code, but it is only a transaction default and can be overr
 session. The SELECT-only PostgreSQL role remains the actual security boundary required for M2
 acceptance (§12).
 
+**Query time limit.** Reporting queries share the database with result ingestion. Every
+Reporting API database connection therefore sets a PostgreSQL `statement_timeout` of
+**10 seconds** (a fixed constant, not configuration). PostgreSQL cancels a statement that runs
+longer; the API answers as described under *Errors* (§7.3).
+
 ### 7.1 Common query parameters and report window
 
 | Param | Rule |
@@ -292,7 +343,13 @@ to calendar days); `now` is the request time in UTC:
 | only `to` | `[to - 7 days, to)` |
 | both | `[from, to)` |
 
-If the effective `from >= to` → `422`.
+If the effective `from >= to` → `422`. If `from`, `to` or the effective window cannot be
+represented as UTC timestamps within the years 1–9999 (e.g. `from=0001-01-01T00:00:00+01:00`, or
+only `to=0001-01-01T00:00:00Z`, whose default `from` would lie before year 1) → `422`.
+
+There is **no maximum window length and no maximum bucket count**. Grouped reports and
+timeseries return one item per group or bucket that contains data (empty buckets are never
+generated, see §7.3), and the database work is bounded by the statement timeout.
 
 Every report response returns the effective `from` and `to` as timezone-aware **UTC** values
 (`...Z`), also when the client sent another offset (e.g. `+02:00`).
@@ -324,11 +381,17 @@ Every report response returns the effective `from` and `to` as timezone-aware **
 
 Errors:
 
-- `422` for invalid report parameters, including naive timestamps, `from >= to`, and missing or
-  invalid `interval`;
-- `503` when the database is unavailable;
-- `500` for other unexpected server/database errors, with a generic response body; details are
-  logged server-side only.
+- `422` for invalid report parameters, including naive timestamps, `from >= to`, windows that
+  cannot be represented in UTC (§7.1), and missing or invalid `interval`;
+- `503` `{"detail":"Database query timed out"}` when PostgreSQL cancels the query
+  (SQLSTATE `57014` `query_canceled`, e.g. because the statement timeout was exceeded; a
+  cancellation by other means, such as `pg_cancel_backend()`, gives the same answer). It is
+  logged as one warning line naming the SQLSTATE and the route, e.g.
+  `Report query cancelled (SQLSTATE 57014, e.g. statement_timeout) on GET /api/v1/reports/summary`,
+  without SQL text, parameters, connection details, exception text or traceback;
+- `503` `{"detail":"Database unavailable"}` when the database is otherwise unavailable;
+- `500` `{"detail":"Internal server error"}` for other unexpected server/database errors;
+  details are logged server-side only.
 
 Example summary:
 
@@ -477,14 +540,38 @@ simulator host clock is ahead by more than that, every result is rejected with `
 
 Why failures after sending are not retried: `POST` has no idempotency key, so the server may
 already have committed the result; a retry could store it twice and distort statistics. Losing
-one synthetic result is harmless; a duplicate is not. Residual risk: a `5xx` returned after the
-row was committed (narrow window) can still lead to a duplicate on retry.
+one synthetic result is harmless; a duplicate is not. The Results API commits as its last
+database step (§5.2), which removes the known path in which later database work (reading back
+the stored row) could turn an already stored result into a `5xx` response. Residual duplicate
+risk remains: if the COMMIT succeeds in the database but its confirmation is lost, the Results
+API answers with a retryable `5xx`, and the simulator's retry can store the result a second
+time.
 
 Response bodies are **never** printed or logged. Logs contain only the status code, the attempt
 number and the exception **class name** (not the exception text).
 
-**Known limitation (M4 backlog):** there is no circuit breaker. During a Results API outage every
-generated result goes through its own retry sequence, so a complete batch can take a long time.
+**Proxy settings.** The HTTP client is explicitly configured to honour the standard proxy
+environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`; httpx
+`trust_env=True`). If a proxy is set in the environment and the Results API must be reached
+directly (e.g. inside a cluster), its host must be listed in `NO_PROXY`. There is no separate
+application setting for this.
+
+**No circuit breaker (accepted).** During a Results API outage every generated result goes
+through its own retry sequence, so a batch can take a long time:
+
+| Scenario | Per result | Batch of 10 (default) | Batch of 1000 (maximum) |
+|---|---|---|---|
+| Connection-timeout outage: every attempt ends at the 3 s connect timeout | 3 × 3 s + 1 s + 2 s = **12 s** | 120 s ≈ **2 min** | 12,000 s ≈ **3.3 h** |
+| Conservative slow-server scenario: every attempt uses the full connect (3 s), write (10 s) and read (10 s) timeouts and then gets a `5xx` | 3 × (3 + 10 + 10) s + 1 s + 2 s = **72 s** | 720 s = **12 min** | 72,000 s = **20 h** |
+
+The second row is a conservative planning figure, not a hard upper bound. The HTTP timeouts
+limit each network wait separately (the read and write timeouts apply to every individual read
+or write, not to the whole request), and resolving the host name is not covered by the connect
+timeout. So a server that keeps sending data slowly, or a slow name resolution, can make an
+attempt take longer. The pool timeout does not add to the figure, because the simulator sends
+one request at a time. A failure after the request was sent is not retried, so it takes at most
+one attempt. How often batches run and whether runs may overlap is controlled by the scheduler
+in the platform layer (e.g. Kubernetes CronJob settings), not by the simulator.
 
 #### 8.3.3 Modes, shutdown and exit codes
 
@@ -492,7 +579,11 @@ Modes (`SIM_MODE`):
 
 - `once` (default): run one batch and exit. (Intended for a Kubernetes **CronJob**; can be
   triggered manually for demos with `kubectl create job --from=cronjob/<name> <job-name>`.)
-  No signal handler is installed: SIGTERM terminates the process immediately.
+  No signal handler is installed: SIGTERM terminates the process immediately (default action).
+  Exception: a process running as **PID 1** (e.g. as a container's main process without an init
+  process) ignores signals that have the default action, so SIGTERM has no effect until the
+  platform sends SIGKILL. A container running `once` mode therefore needs an init process
+  (e.g. `tini` or `docker run --init`).
 - `loop` (for local Docker Compose): the first batch starts immediately; after each **completed**
   batch the simulator waits `SIM_INTERVAL_S` seconds (fixed delay, not fixed rate), then starts
   the next batch, until SIGTERM (or SIGINT, e.g. Ctrl+C). A batch with zero accepted results does
@@ -580,6 +671,21 @@ undelivered and summary formatting). How they are written to stdout is defined i
 
 Separate `DB_*` variables (instead of one URL) let non-secret values live in a ConfigMap and only the
 password in a Secret. `.env.example` lists all variables with dummy values; real `.env` files are git-ignored.
+
+The Results API migration command (`alembic upgrade head`) reads only `DB_HOST`, `DB_PORT`,
+`DB_NAME`, `DB_USER`, `DB_PASSWORD`, `APP_ENV`, `LOG_LEVEL` and `LOG_FORMAT` (§2, rule 7).
+
+**API logging details:**
+
+- `LOG_LEVEL` applies to every logger of an API process, including the loggers of the uvicorn
+  web server (startup lines and access lines).
+- uvicorn's per-request access lines use the same `text`/`json` format as the application.
+  Access lines for the probe and scrape paths — exactly `/health`, `/ready` and `/metrics`
+  (a query string is ignored; `/healthz` or `/api/v1/health` do not match) — are **not** written
+  when the response status is below `400`. Failures (status `400` or higher, e.g. `/ready` →
+  `503`) are always written. An access-log record whose format is not recognised is always
+  written (the filter never drops what it cannot interpret).
+- This only concerns logs; the Prometheus HTTP metrics exclude these paths independently (§2).
 
 Simulator validation (fail fast, exit code `2`; the error names the variable, never its value):
 
