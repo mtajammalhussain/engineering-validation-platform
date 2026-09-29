@@ -105,6 +105,11 @@ These rules make the application run on Kubernetes without rework.
     `/api/v1/results` → results-api, `/api/v1/reports` → reporting-api.
 11. **Swagger UI** (`/docs`) stays enabled in all environments; it is the demo interface.
 
+**Simulator (CLI):** items 1–4, 8 and 9 apply to the simulator. Items 5, 6, 7, 10 and 11 are
+API-only: the simulator runs **no HTTP server** (no `/health`, `/ready`, `/metrics`, `/docs`) and
+has no database. It only calls `POST /api/v1/results`. No server is added merely to satisfy these
+items. Its fail-fast exit code is `2` (see §8.3.3).
+
 ---
 
 ## 3. Repository layout
@@ -125,9 +130,12 @@ engineering-validation-platform/
 │   │                              #   models.py only describes the read-only table;
 │   │                              #   adds calculations.py, queries.py, routers/reports.py
 │   └── simulator/
-│       ├── simulator/ (main.py, config.py, catalog.py, verdict.py, generator.py, client.py, output.py)
-│       ├── tests/unit/
-│       └── requirements.txt  requirements-dev.txt  README.md
+│       ├── simulator/ (__main__.py, main.py, config.py, logging_config.py, catalog.py,
+│       │               verdict.py, generator.py, client.py, output.py)
+│       │              # started with: python -m simulator
+│       ├── tests/unit/            # no database, no network: fakes.py, test_*.py
+│       │                          #   (no tests/integration/: the simulator has no database)
+│       └── requirements.txt  requirements-dev.txt  setup.cfg  README.md
 │
 ├── docker-compose.yml             # platform layer (planned)
 ├── k8s/base/  k8s/overlays/{dev,prod}/   # platform layer: Kustomize (planned)
@@ -170,8 +178,8 @@ Example rows:
 | id | device_id | test_name | temperature_c | measured_value | unit | verdict |
 |---|---|---|---|---|---|---|
 | 1 | ECU-001 | Sleep Current | -30 | 0.18 | mA | PASS |
-| 2 | ECU-002 | Sleep Current | -40 | 137.0 | mA | FAIL |
-| 3 | ECU-003 | Wake-up Time | 25 | 97.0 | ms | PASS |
+| 2 | ECU-002 | Sleep Current | -40 | 0.52 | mA | FAIL |
+| 3 | ECU-003 | Wake-up Time | 23 | 97.0 | ms | PASS |
 
 Database roles (`evp_writer`, `evp_reader`) are provisioned by the platform layer, not by
 application code. The application works with whichever database user it is given.
@@ -374,47 +382,183 @@ def evaluate(measured_value: float, limit_min: float | None, limit_max: float | 
 
 - Limits are **inclusive**: `limit_min <= value <= limit_max` → `PASS`, otherwise `FAIL`.
 - `None` means no limit on that side. Both `None` → `ValueError`.
-- `NaN` / `±inf` → `ValueError`.
+- `NaN` / `±inf` → `ValueError`, for the measured value **and** for any given limit.
+- `limit_min > limit_max` (both given) → `ValueError`.
 
 ### 8.3 Behaviour
 
-1. Generate `SIM_BATCH_SIZE` results. For each: random test from the catalog, random device
-   `ECU-001 … ECU-{SIM_DEVICE_COUNT:03}`, temperature from `[-40, -30, -20, 23, 85, 105]`,
-   `started_at = now (UTC)`, `duration_s` between 5 and 60.
-2. Value generation:
-   - With probability `SIM_FAILURE_RATE`: a value **outside** the limits.
-   - Otherwise a value **inside** the limits; occasionally (~2 %) **exactly on** a limit.
-   - Colder temperatures slightly increase the failure probability for Sleep Current.
-3. Decide the verdict with `evaluate()` and include limits + verdict in the POST.
-4. `POST` with the `X-API-Key` header. Retry network errors/5xx with exponential backoff
-   (max 3 attempts); no retry on 4xx.
-5. After each **accepted** result (201), print one result line (§8.4). Rejected results print a
-   REJECTED line.
-6. After each batch, print a summary line.
+Overview of one batch:
+
+1. Generate `SIM_BATCH_SIZE` results (§8.3.1).
+2. Decide each verdict with `evaluate()` and include limits + verdict in the POST.
+3. `POST` each result with the `X-API-Key` header, with limited retries (§8.3.2).
+4. After each result, output one line (§8.4): a result line if it was **accepted** (`201`),
+   otherwise a `REJECTED` or `UNDELIVERED` line.
+5. After each batch, output one summary line (§8.4).
+
+#### 8.3.1 Result generation (`generator.py`)
+
+For each result, in this order (so a seed gives a stable sequence): random test from the catalog,
+random device `ECU-001 … ECU-{SIM_DEVICE_COUNT:03}`, temperature from
+`[-40, -30, -20, 23, 85, 105]`, failure decision, measured value, `duration_s` uniform between
+5 and 60 (1 decimal). `started_at` is the current time in UTC (timezone-aware), taken for each
+result when it is generated.
+
+**Measurement resolution.** The bench measures with a resolution of **0.01** of the unit: every
+measured value is a whole number of hundredths (generated as an integer `k`, value `= k / 100`).
+The **same** value is evaluated, sent and displayed, so the displayed value always agrees with
+the verdict (no `0.40 mA … FAIL (limits: 0.01–0.40 mA)` caused by hidden decimals). Measured
+values are never negative (all quantities are magnitudes).
+
+**Failure probability.** A result is generated **outside** its limits with probability
+`SIM_FAILURE_RATE`, otherwise **inside**. Exception, **Sleep Current**:
+
+| Temperature | Effective failure probability |
+|---|---|
+| `temperature_c < 0` | `min(1.0, SIM_FAILURE_RATE × 1.5)` |
+| `temperature_c >= 0` | `SIM_FAILURE_RATE` |
+
+All other tests are unaffected. This is an intentionally **synthetic ECU validation fault
+model**, not a model of semiconductor leakage: cold conditions increase the probability that the
+ECU does not reach or maintain its intended low-current sleep state. With
+`SIM_FAILURE_RATE = 0` no result fails.
+
+**Value ranges** (`span = max − min`, all values on the 0.01 grid):
+
+| Case | Generated value |
+|---|---|
+| Inside, two-sided | uniform in `[min, max]` |
+| Exactly on a limit | 2 % of the inside results: `min` or `max` (50/50); one-sided: `max` |
+| Outside, two-sided | 50/50 below or above. Above: `[max + 0.01, max + span/2]`. Below: `[max(0, min − span/2), min − 0.01]`; if that range is empty, above is used |
+| One-sided maximum (e.g. Wake-up Time) | treated as `min = max/2` **for generation only** (never sent), so `span = 75`: inside `[75.00, 150.00]`, outside `[150.01, 187.50]` |
+
+Derived generation bounds that do not fall on the 0.01 grid are rounded inward: lower bounds up
+to the next hundredth, upper bounds down to the previous hundredth. Catalog limits themselves are
+not changed. Example, Sleep Current: `max = 0.40`, `span = 0.39`, `max + span/2 = 0.595` → upper
+bound `0.59`.
+
+Examples: Sleep Current below → `0.00 mA`, above → `0.41–0.59 mA`. The catalog only contains
+two-sided and maximum-only tests; generating values for a minimum-only test is not supported
+(a unit test guards the catalog shape). `evaluate()` and the output formatting still support
+minimum-only limits.
+
+**Payload.** Exactly the fields of §5.2, nothing else: `device_id`, `test_name`,
+`temperature_c`, `measured_value`, `unit`, `limit_min`, `limit_max` (`null` if the catalog has no
+limit on that side), `verdict`, `started_at`, `duration_s`, and `source` = `"simulator"` (sent
+explicitly).
+
+**Seed.** `SIM_SEED` (optional) makes the generated data reproducible: the same seed gives the
+same tests, devices, temperatures, values and durations. `started_at` is real time and is not
+reproducible. The random generator is seeded once per process, so in `loop` mode the whole run
+repeats, not each batch. Retries and backoff consume no random numbers, so network behaviour does
+not change the generated data.
+
+**Clock.** The Results API rejects `started_at` more than 5 minutes in the future (§5.2). If the
+simulator host clock is ahead by more than that, every result is rejected with `422`.
+
+#### 8.3.2 Sending and retries (`client.py`)
+
+- `POST {RESULTS_API_URL}/api/v1/results` with header `X-API-Key`. The key is only ever placed
+  in this header.
+- HTTP timeouts: connect 3 s; read, write and pool 10 s. The read timeout is longer than the
+  Results API's 3 s database connect timeout, so a database outage arrives as `503` instead of a
+  read timeout.
+- **At most 3 attempts in total** (1 initial + 2 retries). Exponential backoff: wait 1 s before
+  the 2nd attempt and 2 s before the 3rd. No random jitter.
+- Redirects are not followed.
+
+| Situation | Retried? | Outcome |
+|---|---|---|
+| `201` | – | **accepted** |
+| Connection could not be established (`httpx.ConnectError`, `ConnectTimeout`, `PoolTimeout`): the request never reached the server | yes | **undelivered** after the 3rd attempt |
+| HTTP `5xx` | yes | **undelivered** after the 3rd attempt |
+| Any other status (`4xx`, `3xx`, other `2xx`) | no | **rejected** |
+| Failure **after** the request was sent (`ReadTimeout`, `ReadError`, `WriteTimeout`, `WriteError`, `RemoteProtocolError`) | **no** | **undelivered** (may have been stored) |
+
+Why failures after sending are not retried: `POST` has no idempotency key, so the server may
+already have committed the result; a retry could store it twice and distort statistics. Losing
+one synthetic result is harmless; a duplicate is not. Residual risk: a `5xx` returned after the
+row was committed (narrow window) can still lead to a duplicate on retry.
+
+Response bodies are **never** printed or logged. Logs contain only the status code, the attempt
+number and the exception **class name** (not the exception text).
+
+**Known limitation (M4 backlog):** there is no circuit breaker. During a Results API outage every
+generated result goes through its own retry sequence, so a complete batch can take a long time.
+
+#### 8.3.3 Modes, shutdown and exit codes
 
 Modes (`SIM_MODE`):
 
-- `once` (default): run one batch and exit. Exit code `0` if ≥1 result accepted, else `1`.
-  (Intended for a Kubernetes **CronJob**; can be triggered manually for demos with
-  `kubectl create job --from=cronjob/<name> <job-name>`.)
-- `loop`: repeat every `SIM_INTERVAL_S` seconds until SIGTERM (for local Docker Compose).
+- `once` (default): run one batch and exit. (Intended for a Kubernetes **CronJob**; can be
+  triggered manually for demos with `kubectl create job --from=cronjob/<name> <job-name>`.)
+  No signal handler is installed: SIGTERM terminates the process immediately.
+- `loop` (for local Docker Compose): the first batch starts immediately; after each **completed**
+  batch the simulator waits `SIM_INTERVAL_S` seconds (fixed delay, not fixed rate), then starts
+  the next batch, until SIGTERM (or SIGINT, e.g. Ctrl+C). A batch with zero accepted results does
+  not stop the loop.
 
-`SIM_SEED` (optional) makes the generated data reproducible.
+Shutdown in `loop` mode: SIGTERM/SIGINT only set a stop flag. The wait between batches and the
+retry backoff waits end **immediately** when the flag is set (no plain long sleep). A request that
+is already in flight finishes, subject to the configured HTTP timeouts; no new result and no
+further retry is started; the summary line of the partial batch is output; exit code `0`.
+The platform termination grace period must allow enough time for an in-flight request to
+complete; this is verified during the Docker/Kubernetes phase.
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | `once`: at least one result accepted. `loop`: clean stop after SIGTERM/SIGINT |
+| `1` | `once`: no result accepted |
+| `2` | invalid configuration (fail fast, before anything is sent) |
+| `3` | unexpected internal error (logged with traceback through the logger, so JSON logs stay JSON) |
 
 ### 8.4 Human-readable output (`output.py`)
 
 ```
 ECU-001 | Test: Sleep Current | Temperature: -30°C | Measured current: 0.18 mA | Result: PASS
-ECU-002 | Test: Sleep Current | Temperature: -40°C | Measured current: 137.50 mA | Result: FAIL (limits: 0.01–0.40 mA)
+ECU-002 | Test: Sleep Current | Temperature: -40°C | Measured current: 0.52 mA | Result: FAIL (limits: 0.01–0.40 mA)
 ECU-007 | Test: Wake-up Time | Temperature: 85°C | Measured time: 97.00 ms | Result: PASS
-ECU-001 | Test: Sleep Current | REJECTED: <reason>
-Batch done: 10 sent | 10 accepted | 9 PASS | 1 FAIL
+ECU-004 | Test: Wake-up Time | Temperature: 105°C | Measured time: 163.25 ms | Result: FAIL (limits: ≤ 150 ms)
+ECU-001 | Test: Sleep Current | REJECTED: HTTP 401 (invalid or missing API key)
+ECU-005 | Test: CAN Cycle Time | UNDELIVERED: ConnectError after 3 attempts
+Batch done: 10 sent | 8 accepted | 1 rejected | 1 undelivered | 7 PASS | 1 FAIL
 ```
+
+**Result line** (accepted results only):
 
 - `Measured <quantity>:` uses the catalog `quantity` and `unit`; value with 2 decimals;
   temperature as integer with `°C`.
-- On `FAIL`, the applied limits are appended (one-sided limits as `≤ 150 ms` / `≥ 5.5 V`).
-- Implemented as a pure function `format_result_line(...) -> str`.
+- On `FAIL`, the applied limits are appended as `(limits: …)`.
+- **Limit precision:** limits are printed with the fewest decimals (0, 1 or 2) that show every
+  limit of that test exactly; both limits of one test use the same number of decimals.
+  Two-sided with an en dash (`–`), one-sided as `≤ <max>` / `≥ <min>` (with a space). Catalog
+  results: `0.01–0.40 mA`, `80–250 mA`, `≤ 150 ms`, `9.5–10.5 ms`, `5.5–6.5 V`; a minimum-only
+  limit would print as `≥ 5.5 V`.
+
+**REJECTED line** (server answered with a non-retryable status): the reason is written by the
+simulator, never taken from the response body:
+
+- `REJECTED: HTTP 401 (invalid or missing API key)`
+- `REJECTED: HTTP 422 (payload failed validation)`
+- `REJECTED: HTTP <code> (unexpected response)` for any other status
+
+**UNDELIVERED line** (no confirmation from the server):
+
+- `UNDELIVERED: HTTP <code> after 3 attempts` (5xx on every attempt)
+- `UNDELIVERED: <ExceptionClass> after 3 attempts` (connection failure on every attempt)
+- `UNDELIVERED: <ExceptionClass>, not retried (may have been stored)` (failure after sending)
+- `UNDELIVERED: shutdown requested before retry` (`loop` mode only)
+
+**Summary line:** all fields are always present, also when `0`.
+
+- `sent` = results the batch attempted to send (including rejected and undelivered ones).
+- `PASS` / `FAIL` count **accepted** results only.
+- Invariants: `sent = accepted + rejected + undelivered` and `accepted = PASS + FAIL`.
+
+All lines are produced by pure functions (e.g. `format_result_line(...) -> str`, limit, rejected,
+undelivered and summary formatting). How they are written to stdout is defined in §9.
 
 ---
 
@@ -437,15 +581,52 @@ Batch done: 10 sent | 10 accepted | 9 PASS | 1 FAIL
 Separate `DB_*` variables (instead of one URL) let non-secret values live in a ConfigMap and only the
 password in a Secret. `.env.example` lists all variables with dummy values; real `.env` files are git-ignored.
 
+Simulator validation (fail fast, exit code `2`; the error names the variable, never its value):
+
+| Variable | Rule | Default |
+|---|---|---|
+| `RESULTS_API_URL` | required; scheme `http` or `https`; host required; no user/password, query or fragment; path empty or `/` (the client appends `/api/v1/results`) | — |
+| `RESULTS_API_KEY` | required secret; at least 1 character; visible ASCII only (`!` … `~`), because an HTTP header cannot carry other characters | — |
+| `SIM_MODE` | `once` or `loop` | `once` |
+| `SIM_BATCH_SIZE` | integer 1–1000 | `10` |
+| `SIM_INTERVAL_S` | integer 1–86400 (validated in both modes) | `60` |
+| `SIM_FAILURE_RATE` | finite number 0.0–1.0 inclusive | `0.08` |
+| `SIM_DEVICE_COUNT` | integer 1–999 (`ECU-###` has three digits) | `20` |
+| `SIM_SEED` | unset **or empty** (`SIM_SEED=`) → no seed; otherwise integer ≥ 0 | unset |
+| `APP_ENV`, `LOG_LEVEL`, `LOG_FORMAT` | same values as the APIs | `dev`, `INFO`, `text` |
+
 `LOG_FORMAT`:
 
-- `text` (default, local development): plain human-readable lines.
+- `text` (default, local development): plain human-readable lines
+  (`<time> | <level> | <logger> | <message>`).
 - `json` (Kubernetes): one JSON object per line; the human-readable line goes into `msg`, structured
-  fields stay separate for filtering:
+  fields stay separate for filtering. JSON is written with `ensure_ascii=False`, so characters such
+  as `°`, `–`, `≤`, `≥` appear literally (not as `\u` escapes):
 
 ```json
 {"ts":"2026-09-23T19:30:43Z","level":"INFO","service":"simulator","env":"dev","msg":"ECU-001 | Test: Sleep Current | Temperature: -30°C | Measured current: 0.18 mA | Result: PASS","device_id":"ECU-001","test_name":"Sleep Current","verdict":"PASS"}
 ```
+
+Simulator output model: all §8.4 lines (result, `REJECTED`, `UNDELIVERED`, batch summary) are log
+records of the logger `simulator.results`, whose `msg` is exactly the §8.4 text. There is no
+separate `print()` output.
+
+| | `LOG_FORMAT=text` | `LOG_FORMAT=json` |
+|---|---|---|
+| `simulator.results` | the **bare** §8.4 line only (no time, level or logger prefix) | `msg` = §8.4 line + structured fields |
+| other simulator loggers (retry attempts, config, internal errors) | normal text format as the APIs | normal JSON format |
+
+- Levels: result lines and summary `INFO`; `REJECTED`, `UNDELIVERED` and retry-attempt messages
+  `WARNING`.
+- Structured fields: result → `device_id`, `test_name`, `verdict`; rejected/undelivered →
+  `device_id`, `test_name`, `outcome`, `status_code` (`null` when there was no HTTP response);
+  summary → `sent`, `accepted`, `rejected`, `undelivered`, `passed`, `failed`.
+  For UNDELIVERED because of a shutdown before a retry, `status_code` is the last HTTP status
+  received, or `null` if no HTTP response was received.
+- The `httpx` and `httpcore` loggers are set to `WARNING` or the global `LOG_LEVEL`, whichever is
+  stricter. Their normal `INFO` request lines (and `DEBUG` details) are therefore suppressed, so
+  the HTTP library adds no extra line per result, and the global threshold still applies (e.g.
+  with `LOG_LEVEL=ERROR` their warnings are not shown either).
 
 ---
 
@@ -500,8 +681,26 @@ Tools: `pytest`, `pytest-cov`, `flake8`. Python 3.12. Exact versions pinned in `
 | 7 | 7.0 | 5.5 | 6.5 | FAIL |
 | 8 | 1.0 | None | None | ValueError |
 | 9 | NaN | 0.01 | 0.40 | ValueError |
+| 10 | inf | 0.01 | 0.40 | ValueError |
+| 11 | 0.20 | NaN | 0.40 | ValueError (non-finite limit) |
+| 12 | 0.20 | 0.40 | 0.01 | ValueError (min > max) |
 
 **Simulator — `format_result_line()`:** a PASS line, a FAIL line with limits, a one-sided FAIL line.
+Also: limit precision for every catalog test and a minimum-only limit (`≥ 5.5 V`); `REJECTED`,
+`UNDELIVERED` and summary lines (including zero counts).
+
+**Simulator — other unit tests** (no network: HTTP is replaced by `httpx.MockTransport`; no real
+waiting: clock, random generator and waits are injected):
+
+- Configuration: defaults, each invalid value from §9 → exit `2`, empty `SIM_SEED`, secret never
+  shown.
+- Generator: same seed → same data; every value on the 0.01 grid and never negative; failure rate
+  `0` → only PASS, `1` → only FAIL; Sleep Current temperature rule; catalog shape.
+- Client: retry/no-retry for every row of the §8.3.2 table, backoff delays `1, 2`, `X-API-Key`
+  header sent.
+- Modes: `once` exit codes `0`/`1`; `loop` stops on the stop flag; SIGTERM handler sets the flag.
+- Logging: `text` mode prints bare `simulator.results` lines; `json` mode keeps `°`, `–`, `≤`, `≥`
+  unescaped.
 
 **Results API — request validation:** valid payload accepted; `verdict: "OK"` → 422;
 naive timestamp → 422; bad `device_id` → 422; missing API key → 401.

@@ -1,0 +1,4 @@
+# Runtime dependencies of the simulator (exact versions, see docs/APP_SPEC.md §11).
+# Same pins as the APIs. httpx is the HTTP client that sends results to the Results API.
+pydantic-settings==2.15.0
+httpx==0.28.1
