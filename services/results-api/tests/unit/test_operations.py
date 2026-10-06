@@ -162,6 +162,18 @@ def test_failed_database_write_is_not_counted(client, session, make_error):
     assert value(client, "evp_results_rejected_total", reason="validation") == 0
 
 
+@pytest.mark.parametrize("step", ["flush", "refresh", "commit"])
+def test_failure_at_any_write_step_is_not_counted(client, session, step):
+    session.error = UNAVAILABLE_ERRORS["operational"]()
+    session.write_error_at = step
+
+    assert post(client).status_code == 503
+
+    assert total_received(client) == 0
+    assert value(client, "evp_results_rejected_total", reason="auth") == 0
+    assert value(client, "evp_results_rejected_total", reason="validation") == 0
+
+
 # --- evp_results_rejected_total ----------------------------------------------------------
 
 @pytest.mark.parametrize("key", [None, "wrong-key"], ids=["missing", "wrong"])

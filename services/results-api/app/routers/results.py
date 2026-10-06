@@ -33,26 +33,39 @@ def create_result(
     payload: ResultCreate,
     db: Session = Depends(get_db),
     metrics: ResultsMetrics = Depends(get_metrics),
-) -> Result:
-    """Store one result. The verdict is stored as sent; the API does not judge it."""
+) -> ResultRead:
+    """Store one result. The verdict is stored as sent; the API does not judge it.
+
+    The commit is the last database step (spec §5.2): a stored result is never turned into
+    an error response by later database work.
+    """
     # exclude_unset=True: fields the client did not send (e.g. "source") are left out of
     # the INSERT, so PostgreSQL applies its server-side default.
     row = Result(**payload.model_dump(exclude_unset=True))
     db.add(row)
     try:
-        db.commit()
+        db.flush()  # send the INSERT inside the open transaction; nothing is committed yet
         db.refresh(row)  # load database-generated values: id, received_at, source
+        # Build the response now: commit() expires `row`, and reading it afterwards would
+        # need another database query.
+        stored = ResultRead.model_validate(row)
+        db.commit()  # the last database step
     except SQLAlchemyError:
         db.rollback()
         raise
+    # Only in-memory work from here on, using `stored`, never `row`.
     # Counted only here, after the commit succeeded.
-    metrics.result_stored(row.test_name, row.verdict)
+    metrics.result_stored(stored.test_name, stored.verdict)
     logger.info(
         "Result stored: id=%s %s %s %s",
-        row.id, row.device_id, row.test_name, row.verdict,
-        extra={"device_id": row.device_id, "test_name": row.test_name, "verdict": row.verdict},
+        stored.id, stored.device_id, stored.test_name, stored.verdict,
+        extra={
+            "device_id": stored.device_id,
+            "test_name": stored.test_name,
+            "verdict": stored.verdict,
+        },
     )
-    return row
+    return stored
 
 
 def build_filters(

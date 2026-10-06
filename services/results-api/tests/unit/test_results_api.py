@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.orm.exc import DetachedInstanceError
 
 import app.main
 from app.main import create_app
@@ -24,6 +25,7 @@ from tests.unit.fakes import (
     API_KEY,
     UNAVAILABLE_ERRORS,
     UNEXPECTED_ERRORS,
+    FakeSession,
     make_settings,
     stored_row,
 )
@@ -36,6 +38,21 @@ ALL_ERRORS = [
 ] + [
     pytest.param(make, 500, "Internal server error", id=name)
     for name, make in UNEXPECTED_ERRORS.items()
+]
+
+# Expected FakeSession call log when the named write step fails (spec §5.2: commit is last).
+FAILED_WRITE_CALLS = {
+    "flush": ["add", "flush", "rollback"],
+    "refresh": ["add", "flush", "refresh", "rollback"],
+    "commit": ["add", "flush", "refresh", "commit", "rollback"],
+}
+WRITE_STEP_ERRORS = [
+    pytest.param(step, make, status_code, detail, id=f"{step}-{name}")
+    for step in FAILED_WRITE_CALLS
+    for name, make, status_code, detail in [
+        *((name, make, 503, "Database unavailable") for name, make in UNAVAILABLE_ERRORS.items()),
+        *((name, make, 500, "Internal server error") for name, make in UNEXPECTED_ERRORS.items()),
+    ]
 ]
 
 
@@ -137,6 +154,112 @@ def test_database_failure_is_logged_server_side(
 
     assert type(session.error).__name__ in caplog.text
     assert "db.example.invalid" in caplog.text  # full details stay in the server log
+
+
+# --- POST: commit is the last database step (spec §5.2) ----------------------------
+# The fake commit makes every refreshed row unreadable (fakes.make_unreadable_like_commit).
+# So a test expecting 201 also proves that nothing reads the ORM row after the commit:
+# such a read would raise DetachedInstanceError and turn the response into an error.
+
+def test_post_commit_is_the_last_database_step(client, session):
+    response = client.post(URL, json=valid_body(), headers={"X-API-Key": API_KEY})
+
+    assert response.status_code == 201
+    assert session.calls == ["add", "flush", "refresh", "commit"]
+    assert session.commits == 1
+    assert session.rollbacks == 0
+    assert session.closed
+
+
+@pytest.mark.parametrize(
+    "sent_source, expected_source",
+    [(None, "value-from-fake-refresh"), ("HIL-7", "HIL-7")],
+    ids=["source-omitted", "source-given"],
+)
+def test_post_response_contains_all_stored_values(client, sent_source, expected_source):
+    body = valid_body(started_at="2026-09-23T19:30:00Z")
+    if sent_source is not None:
+        body["source"] = sent_source
+
+    response = client.post(URL, json=body, headers={"X-API-Key": API_KEY})
+
+    # The row is unreadable after the commit, so this complete body must have been built
+    # before the commit.
+    assert response.status_code == 201
+    assert response.json() == {
+        "id": 1,
+        "device_id": "ECU-003",
+        "test_name": "Sleep Current",
+        "temperature_c": -30.0,
+        "measured_value": 0.22,
+        "unit": "mA",
+        "limit_min": 0.01,
+        "limit_max": 0.40,
+        "verdict": "PASS",
+        "started_at": "2026-09-23T19:30:00Z",
+        "duration_s": 42.0,
+        "received_at": "2026-09-24T12:00:00Z",
+        "source": expected_source,
+    }
+
+
+def test_post_row_is_not_read_after_commit(client, session):
+    response = client.post(URL, json=valid_body(), headers={"X-API-Key": API_KEY})
+
+    assert response.status_code == 201
+    # The guard was active during the request: the stored row cannot be read any more.
+    with pytest.raises(DetachedInstanceError):
+        session.added[0].device_id
+
+
+def test_fake_commit_makes_refreshed_rows_unreadable():
+    """Self-test of the test infrastructure (no app): if this fails, fix the fake."""
+    session = FakeSession()
+    row = stored_row()
+    session.add(row)
+    session.flush()
+    session.refresh(row)
+    assert row.device_id == "ECU-001"  # readable before the commit
+
+    session.commit()
+
+    for column in ("id", "device_id", "verdict", "received_at"):
+        with pytest.raises(DetachedInstanceError):
+            getattr(row, column)
+
+
+@pytest.mark.parametrize("step, make_error, status_code, detail", WRITE_STEP_ERRORS)
+def test_post_failure_at_each_write_step(client, session, step, make_error, status_code, detail):
+    session.error = make_error()
+    session.write_error_at = step
+
+    response = client.post(URL, json=valid_body(), headers={"X-API-Key": API_KEY})
+
+    assert_generic_error(response, status_code, detail)
+    # Same error answer as before; rolled back; nothing committed; no database call after
+    # the failing step except the rollback.
+    assert session.calls == FAILED_WRITE_CALLS[step]
+    assert session.commits == 0
+    assert session.rollbacks == 1
+    assert session.closed
+
+
+def test_post_refresh_failure_commits_nothing(client, session):
+    """Regression test for the old duplicate path.
+
+    Before: commit, then refresh. If the refresh failed, the row was already stored but the
+    client got 503 and retried, so the result could be stored twice. Now the refresh runs
+    before the commit, so a failing refresh means nothing is committed and a retry is safe.
+    """
+    session.error = UNAVAILABLE_ERRORS["operational"]()
+    session.write_error_at = "refresh"
+
+    response = client.post(URL, json=valid_body(), headers={"X-API-Key": API_KEY})
+
+    assert_generic_error(response, 503, "Database unavailable")
+    assert "commit" not in session.calls
+    assert session.commits == 0
+    assert session.rollbacks == 1
 
 
 # --- API key -----------------------------------------------------------------------
