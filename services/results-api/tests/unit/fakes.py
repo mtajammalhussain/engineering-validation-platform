@@ -1,10 +1,12 @@
-"""Shared test helpers: settings, request bodies and a fake database session.
+"""Unit-test helpers: settings, stored rows and a fake database session.
+
+Request bodies shared with the integration tests live in tests/common.py.
 
 No database and no network. The fake session only records what the code asks for; it
 proves nothing about real PostgreSQL behaviour (that is what the integration tests do).
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from sqlalchemy import inspect
@@ -22,7 +24,6 @@ from app.config import Settings
 from app.models import Result
 
 API_KEY = "test-api-key"
-URL = "/api/v1/results"
 
 SQL = "INSERT INTO test_results ..."
 DETAIL = Exception("server at db.example.invalid: low-level detail")
@@ -118,27 +119,6 @@ class FakeSession:
         if self.error is not None:
             raise self.error
         return self.by_id.get(ident)
-
-
-def iso(dt: datetime) -> str:
-    return dt.isoformat().replace("+00:00", "Z")
-
-
-def valid_body(**overrides) -> dict:
-    body = {
-        "device_id": "ECU-003",
-        "test_name": "Sleep Current",
-        "temperature_c": -30,
-        "measured_value": 0.22,
-        "unit": "mA",
-        "limit_min": 0.01,
-        "limit_max": 0.40,
-        "verdict": "PASS",
-        "started_at": iso(datetime.now(timezone.utc) - timedelta(minutes=1)),
-        "duration_s": 42.0,
-    }
-    body.update(overrides)
-    return body
 
 
 def stored_row(result_id: int = 7) -> Result:

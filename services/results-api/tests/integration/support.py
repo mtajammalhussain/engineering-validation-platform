@@ -91,7 +91,8 @@ def alembic_env(config: IntegrationDbConfig) -> dict[str, str]:
     """Environment for an Alembic subprocess: the validated TEST_DB_* values as DB_*.
 
     Only this child process sees the mapping; the developer's shell is not changed.
-    PORT and RESULTS_API_KEY are required by Settings (known M4 item) and get test values.
+    Migrations must not need the API-only settings (docs/APP_SPEC.md §2 rule 7), so
+    PORT and RESULTS_API_KEY are removed even if the developer's shell has them.
     """
     env = dict(os.environ)
     env.update(
@@ -100,12 +101,12 @@ def alembic_env(config: IntegrationDbConfig) -> dict[str, str]:
         DB_NAME=config.name,
         DB_USER=config.user,
         DB_PASSWORD=config.password,
-        PORT="8001",
-        RESULTS_API_KEY=INTEGRATION_API_KEY,
         APP_ENV="dev",
         LOG_LEVEL="WARNING",
         LOG_FORMAT="text",
     )
+    env.pop("PORT", None)
+    env.pop("RESULTS_API_KEY", None)
     return env
 
 

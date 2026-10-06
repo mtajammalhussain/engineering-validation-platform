@@ -2,6 +2,8 @@
 
 The schema comes only from app.models (Base.metadata) and the connection only from
 app.config + app.db, so nothing about the table or the database URL is defined twice.
+Only the migration settings (DB_*, APP_ENV, LOG_*) are loaded; the API-only settings
+PORT and RESULTS_API_KEY are not needed here (docs/APP_SPEC.md §2 rule 7, §9).
 Migrations run only via the ``alembic`` command, never on application startup.
 """
 
@@ -9,12 +11,12 @@ from alembic import context
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
-from app.config import load_settings
+from app.config import load_migration_settings
 from app.db import build_database_url
 from app.logging_config import configure_logging
 from app.models import Base
 
-settings = load_settings()
+settings = load_migration_settings()
 configure_logging(settings)
 
 # The models are the single source of truth for the schema (used by autogenerate).

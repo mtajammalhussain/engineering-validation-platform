@@ -19,14 +19,13 @@ from sqlalchemy.dialects import postgresql
 
 import app.main
 from app.main import create_app
+from tests.common import URL, valid_body
 from tests.unit.fakes import (
     API_KEY,
     UNAVAILABLE_ERRORS,
     UNEXPECTED_ERRORS,
-    URL,
     make_settings,
     stored_row,
-    valid_body,
 )
 
 SERVICE_DIR = Path(__file__).resolve().parents[2]

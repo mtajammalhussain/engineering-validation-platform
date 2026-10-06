@@ -5,7 +5,7 @@ import logging
 import sys
 from datetime import datetime, timezone
 
-from app.config import Settings
+from app.config import MigrationSettings
 
 SERVICE_NAME = "results-api"
 
@@ -47,7 +47,7 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(entry, ensure_ascii=False, default=str)
 
 
-def configure_logging(settings: Settings) -> None:
+def configure_logging(settings: MigrationSettings) -> None:
     """Send all log output to stdout, in the format and level from the settings."""
     handler = logging.StreamHandler(sys.stdout)
     if settings.log_format == "json":

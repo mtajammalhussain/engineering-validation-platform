@@ -16,13 +16,12 @@ from prometheus_client import CONTENT_TYPE_LATEST
 import app.main
 from app.main import create_app
 from app.metrics import ResultsMetrics
+from tests.common import URL, valid_body
 from tests.unit.fakes import (
     API_KEY,
     UNAVAILABLE_ERRORS,
     UNEXPECTED_ERRORS,
-    URL,
     make_settings,
-    valid_body,
 )
 
 ALL_DB_ERRORS = {**UNAVAILABLE_ERRORS, **UNEXPECTED_ERRORS}

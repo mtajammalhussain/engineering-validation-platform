@@ -11,7 +11,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.models import Result
 from tests.integration.support import INTEGRATION_API_KEY
-from tests.unit.fakes import URL, valid_body
+from tests.common import URL, valid_body
 
 pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("clean_db")]
 

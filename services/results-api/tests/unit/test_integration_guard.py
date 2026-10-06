@@ -85,7 +85,22 @@ def test_alembic_subprocess_gets_test_database_as_db_vars(monkeypatch):
     assert env["DB_NAME"] == "evp_test"
     assert env["DB_HOST"] == "localhost"
     assert env["DB_PASSWORD"] == "test-password-must-not-leak"
-    assert env["PORT"] and env["RESULTS_API_KEY"]
+    assert "PORT" not in env
+    assert "RESULTS_API_KEY" not in env
+
+
+def test_alembic_env_removes_api_only_variables_from_the_developer_shell(monkeypatch):
+    import os
+
+    monkeypatch.setenv("PORT", "8001")
+    monkeypatch.setenv("RESULTS_API_KEY", "shell-key-must-not-reach-alembic")
+
+    env = alembic_env(load_test_db_config(VALID))
+
+    assert "PORT" not in env
+    assert "RESULTS_API_KEY" not in env
+    assert os.environ["PORT"] == "8001"
+    assert os.environ["RESULTS_API_KEY"] == "shell-key-must-not-reach-alembic"
 
 
 def test_alembic_env_does_not_change_the_developer_environment(monkeypatch):
