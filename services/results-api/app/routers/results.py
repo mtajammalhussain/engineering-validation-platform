@@ -106,6 +106,13 @@ def list_results(
     db: Session = Depends(get_db),
 ) -> ResultList:
     """List results, newest ``started_at`` first, with optional filters and pagination."""
+    # Same rule and same answer as the Reporting API (spec §5.3, §7.1). Compares instants,
+    # so the same moment written with different offsets counts as equal.
+    if from_ is not None and to is not None and from_ >= to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="from must be earlier than to",
+        )
     conditions = build_filters(device_id, test_name, verdict, from_, to)
 
     total = db.scalar(select(func.count()).select_from(Result).where(*conditions))

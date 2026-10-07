@@ -113,13 +113,34 @@ def test_post_omitted_limits_are_not_written(client, session):
 @pytest.mark.parametrize(
     "overrides",
     [{"verdict": "OK"}, {"device_id": "ECU-1"}, {"started_at": "2026-09-23T19:30:00"},
-     {"unknown": 1}, {"source": None}],
+     {"unknown": 1}, {"source": None}, {"source": ""}, {"source": "   "},
+     {"limit_min": 1, "limit_max": 0.5}, {"started_at": "0001-01-01T00:00:00+01:00"}],
 )
 def test_post_invalid_body_returns_422(client, session, overrides):
     response = client.post(URL, json=valid_body(**overrides), headers={"X-API-Key": API_KEY})
 
     assert response.status_code == 422
+    assert isinstance(response.json()["detail"], list)  # FastAPI's standard validation body
     assert session.added == []
+
+
+def test_post_source_is_stored_exactly_as_sent(client, session):
+    response = client.post(URL, json=valid_body(source="  HIL-7  "), headers={"X-API-Key": API_KEY})
+
+    assert response.status_code == 201
+    assert session.written[0]["source"] == "  HIL-7  "
+    assert response.json()["source"] == "  HIL-7  "
+
+
+def test_post_verdict_is_stored_as_sent_with_equal_limits(client, session):
+    # Far outside the limits but reported as PASS: the limit check never judges the value.
+    body = valid_body(limit_min=0.40, limit_max=0.40, measured_value=999, verdict="PASS")
+
+    response = client.post(URL, json=body, headers={"X-API-Key": API_KEY})
+
+    assert response.status_code == 201
+    assert session.written[0]["verdict"] == "PASS"
+    assert response.json()["verdict"] == "PASS"
 
 
 def test_post_non_json_body_returns_422(client, session):
@@ -387,6 +408,41 @@ def test_list_invalid_filters_return_422(client, session, params):
 
     assert response.status_code == 422
     assert session.statements == []
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"from": "2026-09-01T00:00:00Z", "to": "2026-09-01T00:00:00Z"},
+        {"from": "2026-09-02T00:00:00Z", "to": "2026-09-01T00:00:00Z"},
+        # The same instant written with two different offsets
+        {"from": "2026-09-23T02:00:00+02:00", "to": "2026-09-23T00:00:00Z"},
+    ],
+    ids=["equal", "reversed", "equal-instant-other-offset"],
+)
+def test_list_from_not_earlier_than_to_returns_422(client, session, params):
+    response = client.get(URL, params=params)
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "from must be earlier than to"}
+    assert session.statements == []
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"from": "0001-01-01T00:00:00+01:00", "to": "9999-12-31T23:59:59-01:00"},
+        {"from": "0001-01-01T00:00:00+01:00"},
+        {"to": "9999-12-31T23:59:59-01:00"},
+    ],
+    ids=["both", "from-only", "to-only"],
+)
+def test_list_extreme_timestamps_are_not_a_server_error(client, session, params):
+    # Valid order: the from/to comparison must not fail on values near year 1 or 9999.
+    response = client.get(URL, params=params)
+
+    assert response.status_code == 200
+    assert len(session.statements) == 2
 
 
 @pytest.mark.parametrize("make_error, status_code, detail", ALL_ERRORS)

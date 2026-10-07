@@ -106,6 +106,27 @@ def test_rejected_post_stores_nothing(client, clean_db):
     assert count_rows(clean_db) == 0
 
 
+def test_post_year_1_utc_round_trip(client, clean_db):
+    """The earliest valid started_at (spec §5.2) is stored and can be read back.
+
+    Compared as instants, not as text: the offset in the response depends on the
+    database session's time zone, which the application does not set. Proves the
+    round trip only for this test database's time zone, not for every possible one.
+    """
+    year_1 = datetime(1, 1, 1, tzinfo=timezone.utc)
+
+    posted = client.post(URL, json=valid_body(started_at="0001-01-01T00:00:00Z"), headers=HEADERS)
+    assert posted.status_code == 201, posted.text
+    result_id = posted.json()["id"]
+    assert datetime.fromisoformat(posted.json()["started_at"]) == year_1
+
+    fetched = client.get(f"{URL}/{result_id}")
+    assert fetched.status_code == 200, fetched.text
+    assert datetime.fromisoformat(fetched.json()["started_at"]) == year_1
+
+    assert result_id in ids(client.get(URL, params={"to": "0001-01-02T00:00:00Z"}))
+
+
 # --- constraints enforced by PostgreSQL itself (API bypassed) -----------------------------
 
 INSERT_SQL = """

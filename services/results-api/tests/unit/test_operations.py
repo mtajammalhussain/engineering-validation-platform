@@ -187,8 +187,11 @@ def test_auth_rejection_is_counted(client, key):
 
 @pytest.mark.parametrize(
     "body",
-    [valid_body(verdict="OK"), valid_body(device_id="ECU-1"), valid_body(unknown=1), {}],
-    ids=["verdict", "device_id", "unknown-field", "empty"],
+    [valid_body(verdict="OK"), valid_body(device_id="ECU-1"), valid_body(unknown=1), {},
+     valid_body(source="   "), valid_body(limit_min=1, limit_max=0.5),
+     valid_body(started_at="0001-01-01T00:00:00+01:00")],
+    ids=["verdict", "device_id", "unknown-field", "empty", "source-blank", "limits-inverted",
+         "started_at-unrepresentable"],
 )
 def test_validation_rejection_is_counted(client, body):
     assert post(client, body).status_code == 422
@@ -217,6 +220,11 @@ def test_unauthenticated_invalid_body_is_counted_once_as_auth(client):
 def test_invalid_get_query_is_not_counted_as_rejected_result(client):
     assert client.get(URL, params={"limit": 999}).status_code == 422
     assert client.get(f"{URL}/abc").status_code == 422
+    reversed_window = client.get(
+        URL, params={"from": "2026-09-02T00:00:00Z", "to": "2026-09-01T00:00:00Z"}
+    )
+    assert reversed_window.status_code == 422
+    assert reversed_window.json() == {"detail": "from must be earlier than to"}
 
     assert value(client, "evp_results_rejected_total", reason="validation") == 0
 

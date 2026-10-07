@@ -129,7 +129,10 @@ def test_non_finite_numbers_are_rejected(field, value):
 @pytest.mark.parametrize("field", ["measured_value", "limit_min", "limit_max"])
 @pytest.mark.parametrize("value", [0, -5.5, 137.0, 1e9])
 def test_finite_numbers_are_accepted(field, value):
-    ResultCreate.model_validate(valid_payload(**{field: value}))
+    # The other limit is left out, so this checks only the single number, not the pair.
+    overrides = {"limit_min": None, "limit_max": None, field: value}
+
+    ResultCreate.model_validate(valid_payload(**overrides))
 
 
 @pytest.mark.parametrize("field", ["limit_min", "limit_max"])
@@ -144,6 +147,27 @@ def test_no_limit_logic_in_the_api():
     result = ResultCreate.model_validate(valid_payload(measured_value=999, verdict="PASS"))
 
     assert result.verdict == "PASS"
+
+
+# --- limit pair -------------------------------------------------------------
+
+def test_inverted_limits_are_rejected():
+    with pytest.raises(ValidationError) as exc_info:
+        ResultCreate.model_validate(valid_payload(limit_min=1.0, limit_max=0.5))
+
+    # A model-level error: it belongs to the whole body, not to one field (loc is empty).
+    [error] = exc_info.value.errors()
+    assert error["loc"] == ()
+    assert "limit_min must not be greater than limit_max" in error["msg"]
+
+
+@pytest.mark.parametrize(
+    "limit_min, limit_max",
+    [(1.0, 1.0), (1.0, None), (None, 1.0), (None, None)],
+    ids=["equal", "only-min", "only-max", "none"],
+)
+def test_consistent_or_partial_limits_are_accepted(limit_min, limit_max):
+    ResultCreate.model_validate(valid_payload(limit_min=limit_min, limit_max=limit_max))
 
 
 # --- verdict ----------------------------------------------------------------
@@ -214,6 +238,28 @@ def test_started_at_not_a_date_is_rejected():
     assert_rejected(valid_payload(started_at="yesterday"), "started_at")
 
 
+@pytest.mark.parametrize(
+    "started_at",
+    ["0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00"],
+    ids=["before-year-1-in-utc", "after-year-9999-in-utc"],
+)
+def test_started_at_not_representable_in_utc_is_rejected(started_at):
+    assert_rejected(valid_payload(started_at=started_at), "started_at")
+
+
+def test_started_at_year_1_utc_is_accepted():
+    result = ResultCreate.model_validate(valid_payload(started_at="0001-01-01T00:00:00Z"))
+
+    assert result.started_at == datetime(1, 1, 1, tzinfo=timezone.utc)
+
+
+def test_started_at_offset_is_kept():
+    # The UTC conversion is only a check: the value keeps the offset it was sent with.
+    result = ResultCreate.model_validate(valid_payload(started_at="2026-09-23T21:30:00+02:00"))
+
+    assert result.started_at.utcoffset() == timedelta(hours=2)
+
+
 # --- source -----------------------------------------------------------------
 
 def test_source_omitted_is_not_set():
@@ -234,6 +280,26 @@ def test_source_given_is_kept():
 
 def test_source_explicit_null_is_rejected():
     assert_rejected(valid_payload(source=None), "source")
+
+
+@pytest.mark.parametrize(
+    "source", ["", " ", "\t\n", "x" * 101], ids=["empty", "space", "tab-newline", "101-chars"]
+)
+def test_source_invalid_is_rejected(source):
+    assert_rejected(valid_payload(source=source), "source")
+
+
+@pytest.mark.parametrize("source", ["x", "x" * 100], ids=["1-char", "100-chars"])
+def test_source_length_boundaries_are_accepted(source):
+    result = ResultCreate.model_validate(valid_payload(source=source))
+
+    assert result.source == source
+
+
+def test_source_is_not_trimmed():
+    result = ResultCreate.model_validate(valid_payload(source="  HIL-7  "))
+
+    assert result.model_dump(exclude_unset=True)["source"] == "  HIL-7  "
 
 
 # --- response models --------------------------------------------------------

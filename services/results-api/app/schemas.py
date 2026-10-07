@@ -1,12 +1,20 @@
 """Request and response models of the Results API (docs/APP_SPEC.md §5.2, §5.3).
 
-Only data-quality checks, no limit logic: the test bench decides the verdict.
+Only data-quality checks. Limits are checked for consistency, but the API never judges
+the measured value or recalculates the verdict.
 """
 
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 MAX_FUTURE = timedelta(minutes=5)
 
@@ -30,23 +38,43 @@ class ResultCreate(BaseModel):
     started_at: AwareDatetime
     duration_s: float = Field(gt=0, allow_inf_nan=False)
     # May be omitted: then the database default 'simulator' applies (no second default here).
-    source: str | None = None
+    source: str | None = Field(default=None, min_length=1, max_length=100)
 
     @field_validator("started_at")
     @classmethod
-    def started_at_not_in_future(cls, value: datetime) -> datetime:
+    def check_started_at(cls, value: datetime) -> datetime:
+        # Only a check: the converted value is not used, the timestamp is stored as sent.
+        # A local time near year 1 or 9999 can fall outside Python's datetime range in UTC.
+        try:
+            value.astimezone(timezone.utc)
+        except OverflowError:
+            raise ValueError("must lie within the years 1-9999 after conversion to UTC") from None
         if value > datetime.now(timezone.utc) + MAX_FUTURE:
             raise ValueError("must not be more than 5 minutes in the future")
         return value
 
     @field_validator("source")
     @classmethod
-    def source_not_null(cls, value: str | None) -> str:
+    def source_not_null_or_blank(cls, value: str | None) -> str:
         # Runs only when "source" is sent. Omitting it is fine; an explicit null is not,
-        # because the database column is NOT NULL.
+        # because the database column is NOT NULL. Runs after the length check.
         if value is None:
             raise ValueError("may be omitted, but must not be null")
-        return value
+        if value.isspace():
+            raise ValueError("must not consist only of whitespace")
+        return value  # stored exactly as sent, never trimmed
+
+    @model_validator(mode="after")
+    def limits_consistent(self) -> "ResultCreate":
+        # Runs once all fields are valid. Only checks that the two reported limits fit
+        # together; it never compares measured_value with them or touches the verdict.
+        if (
+            self.limit_min is not None
+            and self.limit_max is not None
+            and self.limit_min > self.limit_max
+        ):
+            raise ValueError("limit_min must not be greater than limit_max")
+        return self
 
 
 class ResultRead(BaseModel):
