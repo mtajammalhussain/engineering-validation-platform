@@ -9,6 +9,7 @@ Datetimes with offsets are always sent via ``params={...}``: the test client URL
 "+" as "%2B". Written raw into a URL, "+" would be read as a space.
 """
 
+import logging
 import operator
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -278,7 +279,62 @@ def test_other_value_errors_are_not_turned_into_422(application, monkeypatch):
     response = TestClient(application, raise_server_exceptions=False).get(URL)
 
     assert response.status_code == 500
+    assert response.json() == {"detail": "Internal server error"}
     assert "internal bug" not in response.text
+
+
+# --- unexpected non-database errors -> generic JSON 500 (spec §7.3) --------------------------
+# Starlette sends the 500 response and then re-raises the exception (so the server can log
+# the traceback). TestClient(raise_server_exceptions=False) returns that response instead
+# of raising. If no response had been sent, TestClient would invent one with an empty
+# body, so the exact JSON body below can only come from the application's handler.
+
+UNEXPECTED_TEXT = "secret detail " + " ".join(LEAK_MARKERS)
+REPORT_REQUESTS = [
+    pytest.param("/api/v1/reports/summary", {}, id="summary"),
+    pytest.param("/api/v1/reports/by-device", {}, id="by-device"),
+    pytest.param("/api/v1/reports/by-test", {}, id="by-test"),
+    pytest.param("/api/v1/reports/timeseries", {"interval": "hour"}, id="timeseries"),
+]
+
+
+@pytest.mark.parametrize("path, params", REPORT_REQUESTS)
+def test_unexpected_error_returns_generic_json_500(application, session, path, params):
+    session.error = RuntimeError(UNEXPECTED_TEXT)
+
+    response = TestClient(application, raise_server_exceptions=False).get(path, params=params)
+
+    assert response.status_code == 500
+    assert response.headers["content-type"] == "application/json"
+    assert response.json() == {"detail": "Internal server error"}
+    assert "secret detail" not in response.text
+    for marker in LEAK_MARKERS:
+        assert marker not in response.text
+    assert session.closed
+
+
+def test_unexpected_error_is_logged_once_without_traceback_or_text(application, session, caplog):
+    session.error = RuntimeError(UNEXPECTED_TEXT)
+
+    TestClient(application, raise_server_exceptions=False).get(URL)
+
+    # One short application line; the single traceback is uvicorn's job (not in TestClient).
+    (record,) = [r for r in caplog.records if r.name == "app.main"]
+    assert record.levelno == logging.ERROR
+    assert record.exc_info is None
+    assert record.getMessage() == f"Unexpected error on GET {URL}: RuntimeError"
+    assert "secret detail" not in caplog.text
+    for marker in LEAK_MARKERS:
+        assert marker not in caplog.text
+
+
+def test_unexpected_error_still_raises_in_default_test_client(client, session):
+    # The handler does not swallow the exception: Starlette re-raises it after the response,
+    # so the default TestClient (and uvicorn in production) still sees it.
+    session.error = RuntimeError(UNEXPECTED_TEXT)
+
+    with pytest.raises(RuntimeError, match="secret detail"):
+        client.get(URL)
 
 
 # --- database errors reach the Stage 2 handlers ----------------------------------------------

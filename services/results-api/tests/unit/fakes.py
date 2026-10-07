@@ -68,8 +68,9 @@ def make_unreadable_like_commit(row: Result) -> None:
 
     Public SQLAlchemy API only. The temporary Session has no database (no bind), so it can
     never run SQL. If this helper itself breaks (e.g. after a SQLAlchemy upgrade), it raises
-    RuntimeError, which no application error handler catches, so the failure is reported as
-    a test-infrastructure problem and not as a 500 from the application.
+    RuntimeError. The generic 500 handler answers it, but Starlette re-raises it afterwards
+    and the default TestClient raises it in the test, so the failure is reported as a
+    test-infrastructure problem and not as a 500 from the application.
     """
     try:
         make_transient_to_detached(row)  # treat it as an existing row (it has an id)

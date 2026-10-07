@@ -87,6 +87,23 @@ async def handle_unexpected_database_error(
     )
 
 
+async def handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+    """Any other exception -> generic 500 JSON (docs/APP_SPEC.md §7.3).
+
+    Starlette sends this response and then re-raises ``exc``; uvicorn then logs the
+    traceback ("Exception in ASGI application"). No ``exc_info`` here, so the traceback is
+    logged only once. This line adds the route and the exception class, not its text.
+    """
+    logger.error(
+        "Unexpected error on %s %s: %s",
+        request.method, request.url.path, type(exc).__name__,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Internal server error"},
+    )
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Build the FastAPI application.
 
@@ -117,6 +134,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     for error_class in DATABASE_UNAVAILABLE_ERRORS:
         app.add_exception_handler(error_class, handle_database_unavailable)
     app.add_exception_handler(SQLAlchemyError, handle_unexpected_database_error)
+    # FastAPI hands the Exception handler to Starlette's outermost ServerErrorMiddleware,
+    # so it only sees exceptions that none of the handlers above has handled.
+    app.add_exception_handler(Exception, handle_unexpected_error)
     app.include_router(health.router)
     app.include_router(reports.router)
     return app

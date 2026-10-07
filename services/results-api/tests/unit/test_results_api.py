@@ -492,6 +492,76 @@ def test_get_database_failure_is_mapped(client, session, make_error, status_code
     assert session.closed
 
 
+# --- unexpected non-database errors -> generic JSON 500 (spec §5.2, §5.3) ----------
+# Starlette sends the 500 response and then re-raises the exception (so the server can log
+# the traceback). TestClient(raise_server_exceptions=False) returns that response instead
+# of raising. If no response had been sent, TestClient would invent one with an empty
+# body, so the exact JSON body below can only come from the application's handler.
+
+UNEXPECTED_TEXT = f"secret detail db.example.invalid db-password-must-not-leak {API_KEY}"
+UNEXPECTED_REQUESTS = [
+    pytest.param("POST", URL, id="post"),
+    pytest.param("GET", URL, id="list"),
+    pytest.param("GET", f"{URL}/7", id="get-by-id"),
+]
+
+
+def no_raise(client) -> TestClient:
+    return TestClient(client.app, raise_server_exceptions=False)
+
+
+@pytest.mark.parametrize("method, path", UNEXPECTED_REQUESTS)
+def test_unexpected_error_returns_generic_json_500(client, session, method, path):
+    session.error = RuntimeError(UNEXPECTED_TEXT)
+
+    response = no_raise(client).request(
+        method, path,
+        json=valid_body() if method == "POST" else None,
+        headers={"X-API-Key": API_KEY},
+    )
+
+    assert response.status_code == 500
+    assert response.headers["content-type"] == "application/json"
+    assert response.json() == {"detail": "Internal server error"}
+    for secret in ("secret detail", "db.example.invalid", "db-password-must-not-leak", API_KEY):
+        assert secret not in response.text
+    assert session.closed
+
+
+def test_unexpected_error_is_logged_once_without_traceback_or_text(client, session, caplog):
+    session.error = RuntimeError(UNEXPECTED_TEXT)
+
+    no_raise(client).get(URL)
+
+    # One short application line; the single traceback is uvicorn's job (not in TestClient).
+    (record,) = [r for r in caplog.records if r.name == "app.main"]
+    assert record.levelno == logging.ERROR
+    assert record.exc_info is None
+    assert record.getMessage() == f"Unexpected error on GET {URL}: RuntimeError"
+    assert "secret detail" not in caplog.text
+    assert API_KEY not in caplog.text
+
+
+def test_unexpected_error_on_post_commits_nothing(client, session):
+    session.error = RuntimeError(UNEXPECTED_TEXT)
+
+    no_raise(client).post(URL, json=valid_body(), headers={"X-API-Key": API_KEY})
+
+    # Not an SQLAlchemyError, so no explicit rollback; closing the session discards it.
+    assert session.calls == ["add", "flush"]
+    assert session.commits == 0
+    assert session.closed
+
+
+def test_unexpected_error_still_raises_in_default_test_client(client, session):
+    # The handler does not swallow the exception: Starlette re-raises it after the response,
+    # so the default TestClient (and uvicorn in production) still sees it.
+    session.error = RuntimeError(UNEXPECTED_TEXT)
+
+    with pytest.raises(RuntimeError, match="secret detail"):
+        client.get(URL)
+
+
 # --- application wiring ------------------------------------------------------------
 
 def test_swagger_ui_and_routes_are_exposed(client):

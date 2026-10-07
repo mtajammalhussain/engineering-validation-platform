@@ -428,6 +428,18 @@ def test_status_codes_are_kept_apart(client, session):
     assert value(client, "http_requests_total", handler=DB_ROUTE, method="GET", status="503") == 1
 
 
+def test_unexpected_error_is_recorded_as_status_500(client, session):
+    # The generic 500 handler runs outside the metrics middleware; the exception passes
+    # through it, and the request is still recorded with status 500.
+    session.error = RuntimeError("secret detail")
+
+    response = TestClient(client.app, raise_server_exceptions=False).get(DB_ROUTE)
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal server error"}
+    assert value(client, "http_requests_total", handler=DB_ROUTE, method="GET", status="500") == 1
+
+
 def test_probe_and_scrape_endpoints_are_excluded_from_http_metrics(client):
     for _ in range(3):
         client.get("/health")

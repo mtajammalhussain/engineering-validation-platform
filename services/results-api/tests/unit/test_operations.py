@@ -11,6 +11,7 @@ PostgreSQL answers (that is covered by the integration tests).
 import logging
 
 import pytest
+from fastapi.testclient import TestClient
 from prometheus_client import CONTENT_TYPE_LATEST
 
 import app.main
@@ -260,6 +261,20 @@ def test_labels_contain_no_secrets_or_unbounded_values(client):
         assert not any(forbidden in label for label in label_values), forbidden
     # Route templates, not concrete URLs:
     assert http_handlers(client) >= {URL, URL + "/{result_id}"}
+
+
+def test_unexpected_error_is_recorded_as_status_500(client, session):
+    # The generic 500 handler runs outside the metrics middleware; the exception passes
+    # through it, and the request is still recorded with status 500.
+    session.error = RuntimeError("secret detail")
+
+    response = TestClient(client.app, raise_server_exceptions=False).post(
+        URL, json=valid_body(), headers={"X-API-Key": API_KEY}
+    )
+
+    assert response.status_code == 500
+    assert value(client, "http_requests_total", handler=URL, method="POST", status="500") == 1
+    assert total_received(client) == 0
 
 
 # --- probe and scrape traffic -----------------------------------------------------------
