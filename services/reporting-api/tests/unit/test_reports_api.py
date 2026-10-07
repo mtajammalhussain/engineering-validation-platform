@@ -21,7 +21,13 @@ import app.main
 import app.routers.reports
 from app.dependencies import get_request_time
 from app.main import create_app
-from tests.unit.fakes import LEAK_MARKERS, UNAVAILABLE_ERRORS, UNEXPECTED_ERRORS, FakeSession
+from tests.unit.fakes import (
+    LEAK_MARKERS,
+    UNAVAILABLE_ERRORS,
+    UNEXPECTED_ERRORS,
+    FakeSession,
+    query_canceled,
+)
 
 URL = "/api/v1/reports/summary"
 NOW = datetime(2026, 9, 25, 10, 0, tzinfo=timezone.utc)
@@ -540,3 +546,59 @@ def test_new_reports_need_no_api_key_and_only_allow_get(client, url):
     assert client.get(url).status_code == 200
     for method in ("post", "put", "delete"):
         assert getattr(client, method)(url).status_code == 405
+
+
+# === Stage 3 hardening: all four report endpoints ============================================
+
+# (path, required params). Passed via params=..., because params replace a query string
+# written into the URL, which would silently drop interval=hour.
+ALL_REPORTS = [
+    (URL, {}),
+    (BY_DEVICE, {}),
+    (BY_TEST, {}),
+    (TIMESERIES, {"interval": "hour"}),
+]
+REPORT_IDS = ["summary", "by-device", "by-test", "timeseries"]
+
+# Stage 0 probe values: valid ISO 8601, but outside Python's datetime range after the
+# conversion to UTC or the 7-day default subtraction.
+OUT_OF_RANGE_PARAMS = {
+    "from-before-year-1-utc": {"from": "0001-01-01T00:00:00+01:00"},
+    "to-after-year-9999-utc": {"to": "9999-12-31T23:59:59-01:00"},
+    "only-to-default-from-underflows": {"to": "0001-01-01T00:00:00Z"},
+}
+
+
+@pytest.mark.parametrize("url, base", ALL_REPORTS, ids=REPORT_IDS)
+@pytest.mark.parametrize(
+    "params", OUT_OF_RANGE_PARAMS.values(), ids=OUT_OF_RANGE_PARAMS.keys()
+)
+def test_out_of_range_window_returns_422(client, session, url, base, params):
+    response = client.get(url, params={**base, **params})
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "from/to out of supported range"}
+    assert session.statements == []
+
+
+@pytest.mark.parametrize("url, base", ALL_REPORTS, ids=REPORT_IDS)
+def test_window_at_the_edge_of_the_supported_range_is_accepted(client, session, url, base):
+    # Exactly representable: only to=0001-01-08Z gives the default from 0001-01-01T00:00Z.
+    response = client.get(url, params={**base, "to": "0001-01-08T00:00:00Z"})
+
+    assert response.status_code == 200
+    assert response.json()["from"] == "0001-01-01T00:00:00Z"
+    assert response.json()["to"] == "0001-01-08T00:00:00Z"
+
+
+@pytest.mark.parametrize("url, base", ALL_REPORTS, ids=REPORT_IDS)
+def test_query_cancelled_returns_503_timeout_body(client, session, url, base):
+    session.error = query_canceled()
+
+    response = client.get(url, params=base)
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Database query timed out"}
+    for marker in LEAK_MARKERS:
+        assert marker not in response.text
+    assert session.closed

@@ -15,12 +15,21 @@ from app.config import Settings
 # Kubernetes probe timeouts (timeoutSeconds) must be set longer than this.
 DB_CONNECT_TIMEOUT_S = 3
 
-# libpq "options": server settings applied when each connection starts. With this one,
-# every transaction on the connection starts read-only, so an accidental INSERT/UPDATE/
-# DELETE/DDL from application code is refused by PostgreSQL (docs/APP_SPEC.md §7).
-# It is only a default that a session could override; the SELECT-only database user
-# remains the real security boundary.
-DB_READ_ONLY_OPTIONS = "-c default_transaction_read_only=on"
+# PostgreSQL cancels any statement on a Reporting connection that runs longer than this
+# (SQLSTATE 57014), so a heavy report cannot occupy the shared database indefinitely.
+# A fixed constant, not configuration (docs/APP_SPEC.md §7).
+DB_STATEMENT_TIMEOUT = "10s"
+
+# libpq "options": server settings applied when each connection starts.
+# - default_transaction_read_only=on: every transaction on the connection starts read-only,
+#   so an accidental INSERT/UPDATE/DELETE/DDL from application code is refused by
+#   PostgreSQL (docs/APP_SPEC.md §7). It is only a default that a session could override;
+#   the SELECT-only database user remains the real security boundary.
+# - statement_timeout: see DB_STATEMENT_TIMEOUT.
+DB_SESSION_OPTIONS = (
+    "-c default_transaction_read_only=on "
+    f"-c statement_timeout={DB_STATEMENT_TIMEOUT}"
+)
 
 
 def build_database_url(settings: Settings) -> URL:
@@ -52,7 +61,7 @@ def create_db_engine(settings: Settings) -> Engine:
         pool_pre_ping=True,
         connect_args={
             "connect_timeout": DB_CONNECT_TIMEOUT_S,
-            "options": DB_READ_ONLY_OPTIONS,
+            "options": DB_SESSION_OPTIONS,
         },
     )
 

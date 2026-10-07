@@ -4,16 +4,18 @@ from sqlalchemy import Engine, event, make_url
 import app.db
 from app.db import (
     DB_CONNECT_TIMEOUT_S,
-    DB_READ_ONLY_OPTIONS,
+    DB_SESSION_OPTIONS,
+    DB_STATEMENT_TIMEOUT,
     build_database_url,
     create_db_engine,
     create_session_factory,
 )
 
 SPECIAL_PASSWORD = "p@ss:w/rd"
+EXPECTED_OPTIONS = "-c default_transaction_read_only=on -c statement_timeout=10s"
 EXPECTED_CONNECT_ARGS = {
     "connect_timeout": 3,
-    "options": "-c default_transaction_read_only=on",
+    "options": EXPECTED_OPTIONS,
 }
 
 
@@ -37,7 +39,7 @@ def test_url_contains_all_parts_from_settings(settings):
 
 
 def test_url_carries_no_query_options(settings):
-    # The read-only setting travels in connect_args, not in the URL.
+    # The read-only and timeout settings travel in connect_args, not in the URL.
     assert build_database_url(settings).query == {}
 
 
@@ -63,7 +65,9 @@ def test_normal_string_representation_masks_password(settings):
 
 def test_driver_option_constants():
     assert DB_CONNECT_TIMEOUT_S == 3
-    assert DB_READ_ONLY_OPTIONS == "-c default_transaction_read_only=on"
+    assert DB_STATEMENT_TIMEOUT == "10s"
+    # Both settings, the read-only default unchanged and the fixed timeout appended.
+    assert DB_SESSION_OPTIONS == EXPECTED_OPTIONS
 
 
 def test_engine_gets_pre_ping_and_both_driver_options(settings, monkeypatch):
@@ -105,7 +109,7 @@ def test_real_engine_hands_both_options_to_the_driver(settings):
         engine.dispose()
 
     assert captured["connect_timeout"] == 3
-    assert captured["options"] == "-c default_transaction_read_only=on"
+    assert captured["options"] == EXPECTED_OPTIONS
     assert captured["host"] == "db.example.invalid"
     assert captured["port"] == 5432
     assert captured["dbname"] == "evp"

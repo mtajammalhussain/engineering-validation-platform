@@ -47,8 +47,9 @@ def resolve_report_window(
     ``now`` is passed in by the caller (captured once per request), so both bounds derive
     from the same instant. All datetimes must be timezone-aware. Everything is converted to
     UTC before the 7-day subtraction, so it is always exactly 168 hours, also across
-    daylight-saving changes. Raises ``ValueError`` if a datetime is naive or the effective
-    ``from >= to``.
+    daylight-saving changes. Raises ``ValueError`` if a datetime is naive, if a bound or the
+    default ``from`` cannot be represented in UTC within the years 1-9999 (Python's datetime
+    range), or if the effective ``from >= to``.
     """
     _require_aware("now", now)
     if from_value is not None:
@@ -56,11 +57,17 @@ def resolve_report_window(
     if to_value is not None:
         _require_aware("to", to_value)
 
-    end = (to_value if to_value is not None else now).astimezone(timezone.utc)
-    if from_value is not None:
-        start = from_value.astimezone(timezone.utc)
-    else:
-        start = end - DEFAULT_REPORT_WINDOW
+    # Converting to UTC or subtracting 7 days can leave the datetime range, e.g.
+    # 0001-01-01T00:00:00+01:00 or only to=0001-01-01T00:00:00Z. Python then raises
+    # OverflowError, which is not a ValueError; it becomes one here so the caller answers 422.
+    try:
+        end = (to_value if to_value is not None else now).astimezone(timezone.utc)
+        if from_value is not None:
+            start = from_value.astimezone(timezone.utc)
+        else:
+            start = end - DEFAULT_REPORT_WINDOW
+    except OverflowError as exc:
+        raise ValueError("from/to out of supported range") from exc
 
     if start >= end:
         raise ValueError("from must be earlier than to")

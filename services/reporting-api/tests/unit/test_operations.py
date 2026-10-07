@@ -21,19 +21,25 @@ from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY
 from sqlalchemy import Engine, text
+from sqlalchemy.exc import OperationalError, ProgrammingError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import Session
 from uvicorn.importer import import_from_string
 
 import app.main
 from app.config import Settings
 from app.dependencies import get_db
-from app.main import create_app
+from app.main import create_app, is_query_canceled
 from tests.unit.fakes import (
     ALL_ERRORS,
     LEAK_MARKERS,
+    SQL,
+    SQLSTATE_ERRORS,
     UNAVAILABLE_ERRORS,
     UNEXPECTED_ERRORS,
     FakeSession,
+    PgDriverError,
+    query_canceled,
 )
 
 SERVICE_DIR = Path(__file__).resolve().parents[2]
@@ -244,17 +250,24 @@ def test_health_does_not_touch_the_database(client):
 
 # --- /ready -------------------------------------------------------------------------------
 
-def test_ready_returns_ok_when_select_1_succeeds(client, session):
+def test_ready_returns_ok_when_the_table_check_succeeds(client, session):
     response = client.get("/ready")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
-    assert [str(statement) for statement in session.statements] == ["SELECT 1"]
+    assert [str(statement) for statement in session.statements] == [
+        "SELECT 1 FROM test_results LIMIT 0"
+    ]
     assert session.closed
 
 
-@pytest.mark.parametrize("make_error", ALL_ERRORS.values(), ids=ALL_ERRORS.keys())
+READY_ERRORS = {**ALL_ERRORS, **SQLSTATE_ERRORS}
+
+
+@pytest.mark.parametrize("make_error", READY_ERRORS.values(), ids=READY_ERRORS.keys())
 def test_ready_returns_503_for_any_database_error(client, session, caplog, make_error):
+    # Includes missing table (42P01), missing SELECT grant (42501) and a cancelled query
+    # (57014): /ready keeps its own body, never the report timeout body or a 500.
     session.error = make_error()
 
     response = client.get("/ready")
@@ -300,6 +313,85 @@ def test_database_error_details_are_logged_server_side(client, session, caplog):
     client.get(DB_ROUTE)
 
     assert "Database unavailable on GET /test-only/db: OperationalError" in caplog.text
+
+
+# --- cancelled query (SQLSTATE 57014, e.g. statement_timeout) -------------------------------
+
+TIMEOUT_LOG = "Report query cancelled (SQLSTATE 57014, e.g. statement_timeout) on GET /test-only/db"
+
+
+def test_query_cancelled_maps_to_503_timeout_body(client, session):
+    session.error = query_canceled()
+
+    response = client.get(DB_ROUTE)
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Database query timed out"}
+    assert_no_leak(response)
+    assert session.closed
+
+
+def test_query_cancelled_logs_exactly_one_safe_warning(client, session, caplog):
+    session.error = query_canceled()
+
+    with caplog.at_level(logging.DEBUG):
+        client.get(DB_ROUTE)
+
+    app_records = [r for r in caplog.records if r.name == "app.main"]
+    assert len(app_records) == 1
+    (record,) = app_records
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == TIMEOUT_LOG
+    assert record.exc_info is None
+    # Not logged a second time through the generic database handlers.
+    assert "Database unavailable" not in caplog.text
+    assert "Unexpected database error" not in caplog.text
+    for forbidden in ("SELECT", "test_results", "db.example.invalid", "low-level detail",
+                      "super-secret-password", "Traceback", "OperationalError"):
+        assert forbidden not in caplog.text, forbidden
+
+
+def test_other_operational_error_codes_keep_the_database_unavailable_path(
+    client, session, caplog
+):
+    # 08006 connection_failure: an outage, not a cancelled query.
+    session.error = OperationalError(SQL, {}, PgDriverError("08006"))
+
+    response = client.get(DB_ROUTE)
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Database unavailable"}
+    assert "Database unavailable on GET /test-only/db: OperationalError" in caplog.text
+    assert "Report query cancelled" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "make_error, expected",
+    [
+        (query_canceled, True),
+        (lambda: OperationalError(SQL, {}, PgDriverError("08006")), False),
+        (lambda: OperationalError(SQL, {}, Exception("no pgcode attribute")), False),
+        (lambda: ProgrammingError(SQL, {}, PgDriverError("57014")), False),
+        (lambda: PoolTimeoutError("QueuePool limit reached"), False),
+    ],
+    ids=["operational-57014", "operational-other-code", "operational-no-pgcode",
+         "programming-57014", "pool-timeout-no-orig"],
+)
+def test_is_query_canceled(make_error, expected):
+    assert is_query_canceled(make_error()) is expected
+
+
+def test_next_request_works_after_a_cancelled_query(client, session):
+    # Fake level only: the session is closed after the failure and the app keeps serving.
+    # Real rollback and recovery are checked by the PostgreSQL integration tests.
+    session.error = query_canceled()
+    assert client.get(DB_ROUTE).status_code == 503
+    assert session.closed
+
+    session.error = None
+    session.closed = False
+    assert client.get(DB_ROUTE).status_code == 200
+    assert session.closed
 
 
 def test_session_is_closed_after_successful_request(client, session):
