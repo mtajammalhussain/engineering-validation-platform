@@ -7,7 +7,7 @@ the first real connection is opened when a query runs.
 from sqlalchemy import URL, Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.config import Settings
+from app.config import MigrationSettings, Settings
 
 # Seconds libpq waits while opening a NEW connection before giving up (its default is to
 # wait forever). Keeps /ready and normal requests from hanging when PostgreSQL is
@@ -16,7 +16,7 @@ from app.config import Settings
 DB_CONNECT_TIMEOUT_S = 3
 
 
-def build_database_url(settings: Settings) -> URL:
+def build_database_url(settings: MigrationSettings) -> URL:
     """Build the PostgreSQL URL from the separate DB_* settings.
 
     ``URL.create`` takes each part separately, so special characters in the password

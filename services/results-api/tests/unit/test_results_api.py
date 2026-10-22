@@ -16,17 +16,18 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.orm.exc import DetachedInstanceError
 
 import app.main
 from app.main import create_app
+from tests.common import URL, valid_body
 from tests.unit.fakes import (
     API_KEY,
     UNAVAILABLE_ERRORS,
     UNEXPECTED_ERRORS,
-    URL,
+    FakeSession,
     make_settings,
     stored_row,
-    valid_body,
 )
 
 SERVICE_DIR = Path(__file__).resolve().parents[2]
@@ -37,6 +38,21 @@ ALL_ERRORS = [
 ] + [
     pytest.param(make, 500, "Internal server error", id=name)
     for name, make in UNEXPECTED_ERRORS.items()
+]
+
+# Expected FakeSession call log when the named write step fails (spec §5.2: commit is last).
+FAILED_WRITE_CALLS = {
+    "flush": ["add", "flush", "rollback"],
+    "refresh": ["add", "flush", "refresh", "rollback"],
+    "commit": ["add", "flush", "refresh", "commit", "rollback"],
+}
+WRITE_STEP_ERRORS = [
+    pytest.param(step, make, status_code, detail, id=f"{step}-{name}")
+    for step in FAILED_WRITE_CALLS
+    for name, make, status_code, detail in [
+        *((name, make, 503, "Database unavailable") for name, make in UNAVAILABLE_ERRORS.items()),
+        *((name, make, 500, "Internal server error") for name, make in UNEXPECTED_ERRORS.items()),
+    ]
 ]
 
 
@@ -97,13 +113,34 @@ def test_post_omitted_limits_are_not_written(client, session):
 @pytest.mark.parametrize(
     "overrides",
     [{"verdict": "OK"}, {"device_id": "ECU-1"}, {"started_at": "2026-09-23T19:30:00"},
-     {"unknown": 1}, {"source": None}],
+     {"unknown": 1}, {"source": None}, {"source": ""}, {"source": "   "},
+     {"limit_min": 1, "limit_max": 0.5}, {"started_at": "0001-01-01T00:00:00+01:00"}],
 )
 def test_post_invalid_body_returns_422(client, session, overrides):
     response = client.post(URL, json=valid_body(**overrides), headers={"X-API-Key": API_KEY})
 
     assert response.status_code == 422
+    assert isinstance(response.json()["detail"], list)  # FastAPI's standard validation body
     assert session.added == []
+
+
+def test_post_source_is_stored_exactly_as_sent(client, session):
+    response = client.post(URL, json=valid_body(source="  HIL-7  "), headers={"X-API-Key": API_KEY})
+
+    assert response.status_code == 201
+    assert session.written[0]["source"] == "  HIL-7  "
+    assert response.json()["source"] == "  HIL-7  "
+
+
+def test_post_verdict_is_stored_as_sent_with_equal_limits(client, session):
+    # Far outside the limits but reported as PASS: the limit check never judges the value.
+    body = valid_body(limit_min=0.40, limit_max=0.40, measured_value=999, verdict="PASS")
+
+    response = client.post(URL, json=body, headers={"X-API-Key": API_KEY})
+
+    assert response.status_code == 201
+    assert session.written[0]["verdict"] == "PASS"
+    assert response.json()["verdict"] == "PASS"
 
 
 def test_post_non_json_body_returns_422(client, session):
@@ -138,6 +175,112 @@ def test_database_failure_is_logged_server_side(
 
     assert type(session.error).__name__ in caplog.text
     assert "db.example.invalid" in caplog.text  # full details stay in the server log
+
+
+# --- POST: commit is the last database step (spec §5.2) ----------------------------
+# The fake commit makes every refreshed row unreadable (fakes.make_unreadable_like_commit).
+# So a test expecting 201 also proves that nothing reads the ORM row after the commit:
+# such a read would raise DetachedInstanceError and turn the response into an error.
+
+def test_post_commit_is_the_last_database_step(client, session):
+    response = client.post(URL, json=valid_body(), headers={"X-API-Key": API_KEY})
+
+    assert response.status_code == 201
+    assert session.calls == ["add", "flush", "refresh", "commit"]
+    assert session.commits == 1
+    assert session.rollbacks == 0
+    assert session.closed
+
+
+@pytest.mark.parametrize(
+    "sent_source, expected_source",
+    [(None, "value-from-fake-refresh"), ("HIL-7", "HIL-7")],
+    ids=["source-omitted", "source-given"],
+)
+def test_post_response_contains_all_stored_values(client, sent_source, expected_source):
+    body = valid_body(started_at="2026-09-23T19:30:00Z")
+    if sent_source is not None:
+        body["source"] = sent_source
+
+    response = client.post(URL, json=body, headers={"X-API-Key": API_KEY})
+
+    # The row is unreadable after the commit, so this complete body must have been built
+    # before the commit.
+    assert response.status_code == 201
+    assert response.json() == {
+        "id": 1,
+        "device_id": "ECU-003",
+        "test_name": "Sleep Current",
+        "temperature_c": -30.0,
+        "measured_value": 0.22,
+        "unit": "mA",
+        "limit_min": 0.01,
+        "limit_max": 0.40,
+        "verdict": "PASS",
+        "started_at": "2026-09-23T19:30:00Z",
+        "duration_s": 42.0,
+        "received_at": "2026-09-24T12:00:00Z",
+        "source": expected_source,
+    }
+
+
+def test_post_row_is_not_read_after_commit(client, session):
+    response = client.post(URL, json=valid_body(), headers={"X-API-Key": API_KEY})
+
+    assert response.status_code == 201
+    # The guard was active during the request: the stored row cannot be read any more.
+    with pytest.raises(DetachedInstanceError):
+        session.added[0].device_id
+
+
+def test_fake_commit_makes_refreshed_rows_unreadable():
+    """Self-test of the test infrastructure (no app): if this fails, fix the fake."""
+    session = FakeSession()
+    row = stored_row()
+    session.add(row)
+    session.flush()
+    session.refresh(row)
+    assert row.device_id == "ECU-001"  # readable before the commit
+
+    session.commit()
+
+    for column in ("id", "device_id", "verdict", "received_at"):
+        with pytest.raises(DetachedInstanceError):
+            getattr(row, column)
+
+
+@pytest.mark.parametrize("step, make_error, status_code, detail", WRITE_STEP_ERRORS)
+def test_post_failure_at_each_write_step(client, session, step, make_error, status_code, detail):
+    session.error = make_error()
+    session.write_error_at = step
+
+    response = client.post(URL, json=valid_body(), headers={"X-API-Key": API_KEY})
+
+    assert_generic_error(response, status_code, detail)
+    # Same error answer as before; rolled back; nothing committed; no database call after
+    # the failing step except the rollback.
+    assert session.calls == FAILED_WRITE_CALLS[step]
+    assert session.commits == 0
+    assert session.rollbacks == 1
+    assert session.closed
+
+
+def test_post_refresh_failure_commits_nothing(client, session):
+    """Regression test for the old duplicate path.
+
+    Before: commit, then refresh. If the refresh failed, the row was already stored but the
+    client got 503 and retried, so the result could be stored twice. Now the refresh runs
+    before the commit, so a failing refresh means nothing is committed and a retry is safe.
+    """
+    session.error = UNAVAILABLE_ERRORS["operational"]()
+    session.write_error_at = "refresh"
+
+    response = client.post(URL, json=valid_body(), headers={"X-API-Key": API_KEY})
+
+    assert_generic_error(response, 503, "Database unavailable")
+    assert "commit" not in session.calls
+    assert session.commits == 0
+    assert session.rollbacks == 1
 
 
 # --- API key -----------------------------------------------------------------------
@@ -267,6 +410,41 @@ def test_list_invalid_filters_return_422(client, session, params):
     assert session.statements == []
 
 
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"from": "2026-09-01T00:00:00Z", "to": "2026-09-01T00:00:00Z"},
+        {"from": "2026-09-02T00:00:00Z", "to": "2026-09-01T00:00:00Z"},
+        # The same instant written with two different offsets
+        {"from": "2026-09-23T02:00:00+02:00", "to": "2026-09-23T00:00:00Z"},
+    ],
+    ids=["equal", "reversed", "equal-instant-other-offset"],
+)
+def test_list_from_not_earlier_than_to_returns_422(client, session, params):
+    response = client.get(URL, params=params)
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "from must be earlier than to"}
+    assert session.statements == []
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"from": "0001-01-01T00:00:00+01:00", "to": "9999-12-31T23:59:59-01:00"},
+        {"from": "0001-01-01T00:00:00+01:00"},
+        {"to": "9999-12-31T23:59:59-01:00"},
+    ],
+    ids=["both", "from-only", "to-only"],
+)
+def test_list_extreme_timestamps_are_not_a_server_error(client, session, params):
+    # Valid order: the from/to comparison must not fail on values near year 1 or 9999.
+    response = client.get(URL, params=params)
+
+    assert response.status_code == 200
+    assert len(session.statements) == 2
+
+
 @pytest.mark.parametrize("make_error, status_code, detail", ALL_ERRORS)
 def test_list_database_failure_is_mapped(client, session, make_error, status_code, detail):
     session.error = make_error()
@@ -312,6 +490,76 @@ def test_get_database_failure_is_mapped(client, session, make_error, status_code
 
     assert_generic_error(response, status_code, detail)
     assert session.closed
+
+
+# --- unexpected non-database errors -> generic JSON 500 (spec §5.2, §5.3) ----------
+# Starlette sends the 500 response and then re-raises the exception (so the server can log
+# the traceback). TestClient(raise_server_exceptions=False) returns that response instead
+# of raising. If no response had been sent, TestClient would invent one with an empty
+# body, so the exact JSON body below can only come from the application's handler.
+
+UNEXPECTED_TEXT = f"secret detail db.example.invalid db-password-must-not-leak {API_KEY}"
+UNEXPECTED_REQUESTS = [
+    pytest.param("POST", URL, id="post"),
+    pytest.param("GET", URL, id="list"),
+    pytest.param("GET", f"{URL}/7", id="get-by-id"),
+]
+
+
+def no_raise(client) -> TestClient:
+    return TestClient(client.app, raise_server_exceptions=False)
+
+
+@pytest.mark.parametrize("method, path", UNEXPECTED_REQUESTS)
+def test_unexpected_error_returns_generic_json_500(client, session, method, path):
+    session.error = RuntimeError(UNEXPECTED_TEXT)
+
+    response = no_raise(client).request(
+        method, path,
+        json=valid_body() if method == "POST" else None,
+        headers={"X-API-Key": API_KEY},
+    )
+
+    assert response.status_code == 500
+    assert response.headers["content-type"] == "application/json"
+    assert response.json() == {"detail": "Internal server error"}
+    for secret in ("secret detail", "db.example.invalid", "db-password-must-not-leak", API_KEY):
+        assert secret not in response.text
+    assert session.closed
+
+
+def test_unexpected_error_is_logged_once_without_traceback_or_text(client, session, caplog):
+    session.error = RuntimeError(UNEXPECTED_TEXT)
+
+    no_raise(client).get(URL)
+
+    # One short application line; the single traceback is uvicorn's job (not in TestClient).
+    (record,) = [r for r in caplog.records if r.name == "app.main"]
+    assert record.levelno == logging.ERROR
+    assert record.exc_info is None
+    assert record.getMessage() == f"Unexpected error on GET {URL}: RuntimeError"
+    assert "secret detail" not in caplog.text
+    assert API_KEY not in caplog.text
+
+
+def test_unexpected_error_on_post_commits_nothing(client, session):
+    session.error = RuntimeError(UNEXPECTED_TEXT)
+
+    no_raise(client).post(URL, json=valid_body(), headers={"X-API-Key": API_KEY})
+
+    # Not an SQLAlchemyError, so no explicit rollback; closing the session discards it.
+    assert session.calls == ["add", "flush"]
+    assert session.commits == 0
+    assert session.closed
+
+
+def test_unexpected_error_still_raises_in_default_test_client(client, session):
+    # The handler does not swallow the exception: Starlette re-raises it after the response,
+    # so the default TestClient (and uvicorn in production) still sees it.
+    session.error = RuntimeError(UNEXPECTED_TEXT)
+
+    with pytest.raises(RuntimeError, match="secret detail"):
+        client.get(URL)
 
 
 # --- application wiring ------------------------------------------------------------

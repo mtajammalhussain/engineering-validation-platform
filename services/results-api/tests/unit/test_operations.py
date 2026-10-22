@@ -11,18 +11,18 @@ PostgreSQL answers (that is covered by the integration tests).
 import logging
 
 import pytest
+from fastapi.testclient import TestClient
 from prometheus_client import CONTENT_TYPE_LATEST
 
 import app.main
 from app.main import create_app
 from app.metrics import ResultsMetrics
+from tests.common import URL, valid_body
 from tests.unit.fakes import (
     API_KEY,
     UNAVAILABLE_ERRORS,
     UNEXPECTED_ERRORS,
-    URL,
     make_settings,
-    valid_body,
 )
 
 ALL_DB_ERRORS = {**UNAVAILABLE_ERRORS, **UNEXPECTED_ERRORS}
@@ -163,6 +163,18 @@ def test_failed_database_write_is_not_counted(client, session, make_error):
     assert value(client, "evp_results_rejected_total", reason="validation") == 0
 
 
+@pytest.mark.parametrize("step", ["flush", "refresh", "commit"])
+def test_failure_at_any_write_step_is_not_counted(client, session, step):
+    session.error = UNAVAILABLE_ERRORS["operational"]()
+    session.write_error_at = step
+
+    assert post(client).status_code == 503
+
+    assert total_received(client) == 0
+    assert value(client, "evp_results_rejected_total", reason="auth") == 0
+    assert value(client, "evp_results_rejected_total", reason="validation") == 0
+
+
 # --- evp_results_rejected_total ----------------------------------------------------------
 
 @pytest.mark.parametrize("key", [None, "wrong-key"], ids=["missing", "wrong"])
@@ -176,8 +188,11 @@ def test_auth_rejection_is_counted(client, key):
 
 @pytest.mark.parametrize(
     "body",
-    [valid_body(verdict="OK"), valid_body(device_id="ECU-1"), valid_body(unknown=1), {}],
-    ids=["verdict", "device_id", "unknown-field", "empty"],
+    [valid_body(verdict="OK"), valid_body(device_id="ECU-1"), valid_body(unknown=1), {},
+     valid_body(source="   "), valid_body(limit_min=1, limit_max=0.5),
+     valid_body(started_at="0001-01-01T00:00:00+01:00")],
+    ids=["verdict", "device_id", "unknown-field", "empty", "source-blank", "limits-inverted",
+         "started_at-unrepresentable"],
 )
 def test_validation_rejection_is_counted(client, body):
     assert post(client, body).status_code == 422
@@ -206,6 +221,11 @@ def test_unauthenticated_invalid_body_is_counted_once_as_auth(client):
 def test_invalid_get_query_is_not_counted_as_rejected_result(client):
     assert client.get(URL, params={"limit": 999}).status_code == 422
     assert client.get(f"{URL}/abc").status_code == 422
+    reversed_window = client.get(
+        URL, params={"from": "2026-09-02T00:00:00Z", "to": "2026-09-01T00:00:00Z"}
+    )
+    assert reversed_window.status_code == 422
+    assert reversed_window.json() == {"detail": "from must be earlier than to"}
 
     assert value(client, "evp_results_rejected_total", reason="validation") == 0
 
@@ -241,6 +261,20 @@ def test_labels_contain_no_secrets_or_unbounded_values(client):
         assert not any(forbidden in label for label in label_values), forbidden
     # Route templates, not concrete URLs:
     assert http_handlers(client) >= {URL, URL + "/{result_id}"}
+
+
+def test_unexpected_error_is_recorded_as_status_500(client, session):
+    # The generic 500 handler runs outside the metrics middleware; the exception passes
+    # through it, and the request is still recorded with status 500.
+    session.error = RuntimeError("secret detail")
+
+    response = TestClient(client.app, raise_server_exceptions=False).post(
+        URL, json=valid_body(), headers={"X-API-Key": API_KEY}
+    )
+
+    assert response.status_code == 500
+    assert value(client, "http_requests_total", handler=URL, method="POST", status="500") == 1
+    assert total_received(client) == 0
 
 
 # --- probe and scrape traffic -----------------------------------------------------------

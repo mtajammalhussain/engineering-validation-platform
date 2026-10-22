@@ -36,6 +36,31 @@ UNEXPECTED_ERRORS = {
 }
 ALL_ERRORS = {**UNAVAILABLE_ERRORS, **UNEXPECTED_ERRORS}
 
+
+class PgDriverError(Exception):
+    """Stands in for a psycopg2 error carrying a PostgreSQL SQLSTATE in ``pgcode``.
+
+    Real psycopg2 errors do not allow setting ``pgcode``, so tests use this instead.
+    The message contains leak markers on purpose.
+    """
+
+    def __init__(self, pgcode: str) -> None:
+        super().__init__("server at db.example.invalid: low-level detail")
+        self.pgcode = pgcode
+
+
+def query_canceled() -> OperationalError:
+    """What SQLAlchemy raises when PostgreSQL cancels a statement (SQLSTATE 57014)."""
+    return OperationalError(SQL, {}, PgDriverError("57014"))
+
+
+# Errors with a real SQLSTATE that /ready must map to its normal 503 body.
+SQLSTATE_ERRORS = {
+    "query-canceled-57014": query_canceled,
+    "undefined-table-42P01": lambda: ProgrammingError(SQL, {}, PgDriverError("42P01")),
+    "insufficient-privilege-42501": lambda: ProgrammingError(SQL, {}, PgDriverError("42501")),
+}
+
 # Strings that must never reach an HTTP response body.
 LEAK_MARKERS = ("db.example.invalid", "SELECT", "test_results", "low-level detail",
                 "super-secret-password", "QueuePool")

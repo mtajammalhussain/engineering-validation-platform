@@ -660,11 +660,13 @@ def test_random_generator_is_created_once_from_sim_seed(process, monkeypatch, en
     assert process.once_calls[0][2] is process.rngs[0]
 
 
-def test_one_plain_http_client_is_created_and_closed(process):
+def test_one_http_client_is_created_with_explicit_trust_env_and_closed(process):
     main()
 
     [client] = process.clients
-    assert (client.args, client.kwargs) == ((), {})  # default httpx settings (trust_env)
+    captured_kwargs = client.kwargs
+    assert client.args == ()
+    assert captured_kwargs == {"trust_env": True}  # explicit, not httpx's implicit default
     assert (client.entered, client.exited) == (1, 1)
     assert process.once_calls[0][0] is client
 

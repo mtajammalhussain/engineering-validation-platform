@@ -220,3 +220,38 @@ def test_naive_datetimes_are_rejected(from_, to, now, name):
     # Full-message match, so "from must be earlier than to" cannot satisfy the "from" case.
     with pytest.raises(ValueError, match=f"^{name} must be timezone-aware$"):
         resolve_report_window(from_, to, now)
+
+
+# --- report window: outside the supported datetime range (N3) -------------------------------
+
+@pytest.mark.parametrize(
+    "from_, to",
+    [
+        # Converting to UTC would give an instant before 0001-01-01T00:00Z.
+        (datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=1))), None),
+        # Converting to UTC would give an instant after 9999-12-31T23:59:59.999999Z.
+        (None, datetime(9999, 12, 31, 23, 59, 59, tzinfo=timezone(timedelta(hours=-1)))),
+        # Only to: the default from (to - 7 days) would lie before year 1.
+        (None, utc(1, 1, 1)),
+        (None, utc(1, 1, 7, 23, 59, 59)),
+    ],
+    ids=["from-before-year-1", "to-after-year-9999", "only-to-year-1", "only-to-just-too-early"],
+)
+def test_out_of_range_window_is_rejected(from_, to):
+    with pytest.raises(ValueError, match="^from/to out of supported range$"):
+        resolve_report_window(from_, to, NOW)
+
+
+@pytest.mark.parametrize(
+    "from_, to, expected",
+    [
+        (None, utc(1, 1, 8), (utc(1, 1, 1), utc(1, 1, 8))),
+        (utc(1, 1, 1), utc(1, 1, 2), (utc(1, 1, 1), utc(1, 1, 2))),
+        (datetime(9999, 12, 31, 23, 59, 59, tzinfo=timezone(timedelta(hours=1))),
+         utc(9999, 12, 31, 23, 59, 59),
+         (utc(9999, 12, 31, 22, 59, 59), utc(9999, 12, 31, 23, 59, 59))),
+    ],
+    ids=["only-to-exactly-7-days-after-year-1", "year-1-utc", "year-9999"],
+)
+def test_extreme_but_representable_windows_are_unchanged(from_, to, expected):
+    assert resolve_report_window(from_, to, NOW) == expected

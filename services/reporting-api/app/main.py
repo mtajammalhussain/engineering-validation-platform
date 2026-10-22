@@ -32,8 +32,38 @@ logger = logging.getLogger(__name__)
 # the general SQLAlchemyError handler. Details are logged, never sent to the client.
 DATABASE_UNAVAILABLE_ERRORS = (OperationalError, InterfaceError, PoolTimeoutError)
 
+# PostgreSQL SQLSTATE "query_canceled": the statement was cancelled, e.g. because it ran
+# longer than statement_timeout (app.db) or by pg_cancel_backend().
+QUERY_CANCELED_SQLSTATE = "57014"
+
+
+def is_query_canceled(exc: SQLAlchemyError) -> bool:
+    """True if PostgreSQL cancelled the statement (SQLSTATE 57014).
+
+    psycopg2 reports this as an OperationalError, which SQLAlchemy wraps; the driver's
+    original exception is ``exc.orig`` and carries the SQLSTATE in ``pgcode``. The
+    isinstance check matters because the pool TimeoutError, handled by the same handler,
+    has no ``orig``.
+    """
+    return (
+        isinstance(exc, OperationalError)
+        and getattr(exc.orig, "pgcode", None) == QUERY_CANCELED_SQLSTATE
+    )
+
 
 async def handle_database_unavailable(request: Request, exc: SQLAlchemyError) -> JSONResponse:
+    if is_query_canceled(exc):
+        # One warning naming SQLSTATE and route only (docs/APP_SPEC.md §7.3): no SQL,
+        # parameters, connection details, exception text or traceback. "e.g." because a
+        # cancellation can also have other causes than the statement timeout.
+        logger.warning(
+            "Report query cancelled (SQLSTATE 57014, e.g. statement_timeout) on %s %s",
+            request.method, request.url.path,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": "Database query timed out"},
+        )
     logger.error(
         "Database unavailable on %s %s: %s",
         request.method, request.url.path, type(exc).__name__, exc_info=exc,
@@ -50,6 +80,23 @@ async def handle_unexpected_database_error(
     logger.error(
         "Unexpected database error on %s %s: %s",
         request.method, request.url.path, type(exc).__name__, exc_info=exc,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Internal server error"},
+    )
+
+
+async def handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+    """Any other exception -> generic 500 JSON (docs/APP_SPEC.md §7.3).
+
+    Starlette sends this response and then re-raises ``exc``; uvicorn then logs the
+    traceback ("Exception in ASGI application"). No ``exc_info`` here, so the traceback is
+    logged only once. This line adds the route and the exception class, not its text.
+    """
+    logger.error(
+        "Unexpected error on %s %s: %s",
+        request.method, request.url.path, type(exc).__name__,
     )
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -87,6 +134,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     for error_class in DATABASE_UNAVAILABLE_ERRORS:
         app.add_exception_handler(error_class, handle_database_unavailable)
     app.add_exception_handler(SQLAlchemyError, handle_unexpected_database_error)
+    # FastAPI hands the Exception handler to Starlette's outermost ServerErrorMiddleware,
+    # so it only sees exceptions that none of the handlers above has handled.
+    app.add_exception_handler(Exception, handle_unexpected_error)
     app.include_router(health.router)
     app.include_router(reports.router)
     return app

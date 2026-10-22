@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["operations"])
 
+READINESS_SQL = "SELECT 1 FROM test_results LIMIT 0"
+
 
 @router.get("/health")
 def health() -> dict[str, str]:
@@ -23,9 +25,15 @@ def health() -> dict[str, str]:
 
 @router.get("/ready", responses={503: {"description": "Database not reachable"}})
 def ready(db: Session = Depends(get_db)) -> JSONResponse:
-    """Readiness: 200 if PostgreSQL answers ``SELECT 1``, otherwise 503."""
+    """Readiness: 200 if PostgreSQL answers the table check, otherwise 503.
+
+    ``LIMIT 0`` reads no rows, but PostgreSQL still checks that ``test_results`` exists and
+    that this database user may SELECT from it (docs/APP_SPEC.md §2.5). A missing table or
+    grant is a ProgrammingError, an outage or cancelled query an OperationalError: both are
+    SQLAlchemyErrors and give 503 below.
+    """
     try:
-        db.execute(text("SELECT 1"))
+        db.execute(text(READINESS_SQL))
     except SQLAlchemyError as exc:
         # Probes run every few seconds: one short warning line, no traceback, no details
         # for the client.

@@ -12,7 +12,8 @@ finished result to the Results API.
 
 The single source of truth for all technical requirements is
 [`docs/APP_SPEC.md`](../../docs/APP_SPEC.md) (§8 describes the simulator). This README explains
-how to run and operate it and records the M3 verification evidence.
+how to run and operate it and records the M3 verification evidence and the M4 platform-contract
+review.
 
 ```
 Simulator (test bench, CLI)
@@ -101,6 +102,12 @@ In `once` mode the simulator installs no signal handlers, so an external `SIGTER
 ends the process with the operating system's/Python's default behaviour. That is outside the
 0/1/2/3 codes above.
 
+**PID 1 caveat (spec §8.3.3; M4 item N5).** A process running as **PID 1** (e.g. as a container's
+main process without an init process) ignores signals that have the default action. In `once`
+mode, SIGTERM therefore has no effect until the platform sends SIGKILL. A container running `once`
+mode needs an init process (e.g. `tini` or `docker run --init`); this is part of the future
+container design (platform work), not of the simulator code.
+
 ## Running continuously (`loop`)
 
 In the same shell and directory as above (root `.env` loaded):
@@ -158,6 +165,33 @@ Ambiguous after-send transport failures listed above are not retried because `PO
 idempotency key: the Results API may already have stored the result, and retrying could store it
 twice. HTTP `5xx` responses are still retried according to the table above. Each actual retry is logged as a
 `WARNING` (`Retrying result delivery after HTTP 503 (attempt 1/3)`).
+
+The Results API commits as its last database step, which removed the known path in which reading
+back an already stored row could turn it into a `5xx` (N2, fixed in the Results API, `99716dc`).
+**Residual duplicate risk (accepted, D1):** if the COMMIT succeeds in the database but its
+confirmation is lost, the Results API answers with a retryable `5xx`, and the simulator's retry can
+store the result a second time (spec §8.3.2).
+
+**Proxy settings (spec §8.3.2; M4 item D10).** The HTTP client is created explicitly with
+`httpx.Client(trust_env=True)`, so the standard proxy environment variables (`HTTP_PROXY`,
+`HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`) are intentionally honoured. If a proxy is set in the
+environment and the Results API must be reached directly (e.g. inside a cluster), its host must be
+listed in `NO_PROXY`. There is no separate simulator setting for this. httpx errors that are in
+neither list of the table above (e.g. a `ProxyError` when a proxy refuses an HTTPS tunnel) are
+treated as unexpected errors (exit code `3`; accepted, N9).
+
+**No circuit breaker (accepted; spec §8.3.2, M4 item D11).** During a Results API outage every
+generated result goes through its own retry sequence, so a batch can take a long time. Figures from
+spec §8.3.2:
+
+| Scenario | Per result | Batch of 10 (default) | Batch of 1000 (maximum) |
+|---|---|---|---|
+| Connection-timeout outage: every attempt ends at the 3 s connect timeout | 3 × 3 s + 1 s + 2 s = **12 s** | 120 s ≈ **2 min** | 12,000 s ≈ **3.3 h** |
+| Conservative slow-server scenario: every attempt uses the full connect (3 s), write (10 s) and read (10 s) timeouts and then gets a `5xx` | 3 × (3 + 10 + 10) s + 1 s + 2 s = **72 s** | 720 s = **12 min** | 72,000 s = **20 h** |
+
+The second row is a conservative planning figure, not a hard upper bound (see spec §8.3.2 for
+why). How often batches run and whether runs may overlap is controlled by the scheduler in the
+platform layer (e.g. Kubernetes CronJob settings), not by the simulator.
 
 ## Output
 
@@ -227,11 +261,13 @@ the end-to-end behaviour is verified manually (below).
 
 Verification evidence (M3 Stage 5/6, Python 3.12.14): `375 passed`, also with warnings treated as
 errors and with invalid simulator variables set in the surrounding shell; `flake8` clean. The
-number of tests will change as the code evolves.
+number of tests will change as the code evolves. For M4 (still 375 tests; one test was renamed),
+`test_one_http_client_is_created_with_explicit_trust_env_and_closed` asserts that the client is
+constructed with exactly `trust_env=True` (D10); see [M4 verification](#m4-verification).
 
 ---
 
-## M3 acceptance evidence (manual end-to-end)
+## M3 acceptance evidence (manual end-to-end, historical)
 
 Performed on 2026-09-26 on a developer machine against the **real** Results API (started locally
 with its documented `uvicorn` command on `127.0.0.1:8001`) and the local PostgreSQL development
@@ -259,25 +295,95 @@ batch summary, and exits 0 (A); with a wrong API key it prints REJECTED lines an
 
 ---
 
-## Known operational notes / M4 backlog
+## Platform contract review (M4)
 
-Full M4 backlog: GitHub issue #3.
+Application implementation reviewed through commit `94cc3ae` against spec §2, on 2026-10-22.
+**Status** describes the application side. Deployment items (image, CronJob, Kubernetes) are
+platform work; they are listed as follow-up and are not assessed here. Per spec §2, rules 1–4, 8
+and 9 apply to the simulator; rules 5, 6, 7, 10 and 11 are API-only (the simulator runs no HTTP
+server and has no database). Evidence types: *automated* (test names), *MANUAL M4* (2026-10-22,
+see [M4 verification](#m4-verification)), *historical MANUAL M3* (2026-09-26, see above).
 
-- **No request idempotency.** Ambiguous transport failures after sending (`ReadTimeout`,
-  `ReadError`, `WriteTimeout`, `WriteError`, `RemoteProtocolError`) are not retried, because the
-  server may already have stored the row; they are reported as `UNDELIVERED`. HTTP `5xx`
-  responses are still retried (see [Retry behaviour](#retry-behaviour)), so a narrow duplicate
-  risk remains if the server commits the row and then returns a `5xx`.
-- **No circuit breaker.** During a Results API outage every generated result goes through its own
-  retry sequence, so a batch can take a long time.
-- **Proxy settings.** The HTTP client uses httpx's default behaviour (`trust_env`), so standard
-  `HTTP(S)_PROXY` environment variables may affect connections. An explicit proxy policy can be
-  considered during hardening.
-- **Signals.** Only `loop` mode handles `SIGTERM`/`SIGINT` gracefully; `once` mode deliberately
-  installs no handlers.
-- **Containers (future platform work).** When the simulator is containerised, the behaviour of the
-  process as PID 1 (signal delivery, reaping) needs to be reviewed, e.g. an init process such as
-  `tini`, `docker run --init` or Compose `init: true`, depending on the final design. Not
-  implemented yet.
-- **No HTTP endpoints.** As a CLI, the simulator has no `/health`, `/ready`, `/metrics` or `/docs`;
-  those platform-contract items apply to the APIs only (spec §2).
+| # | Rule (spec §2) | Status | Evidence | Platform follow-up |
+|---|---|---|---|---|
+| 1 | All configuration via env vars | MET | `simulator/config.py`; no hard-coded host, port or key. Proxies only via the standard proxy variables (D10, see [Retry behaviour](#retry-behaviour)). HTTP timeouts and retries are specified constants (spec §8.3.2) | ConfigMap for non-secret values, Secret for `RESULTS_API_KEY`; set `NO_PROXY` if a proxy is injected and the Results API must be reached directly |
+| 2 | Fail fast on bad config | MET | Automated: `test_missing_required_variable_exits_2_and_names_it`, `test_invalid_value_exits_2_and_names_it`, `test_invalid_configuration_exits_2_before_anything_starts` (exit `2`, the variable is named, never its value). Historical MANUAL M3 scenario G | – |
+| 3 | Stateless | MET | No files written; no database; each run only sends results over HTTP | – |
+| 4 | Logs to stdout, secrets never logged, format selectable | MET | `simulator/logging_config.py` (all lines are records of `simulator.results` or other loggers on stdout); automated: `test_no_secret_leaks_into_logs_output_or_result`, `test_api_key_is_a_secret_and_hidden_in_repr`, text/json logging tests. Historical MANUAL M3 scenarios B, E | Log collection from stdout |
+| 5 | `/health`, `/ready` | N/A (API-only, spec §2) | No HTTP server | – |
+| 6 | `/metrics` | N/A (API-only, spec §2) | No HTTP server | – |
+| 7 | Migrations separate | N/A (API-only, spec §2) | No database | – |
+| 8 | Graceful shutdown on SIGTERM (loop mode) | MET | `loop`: SIGTERM/SIGINT only set a stop flag, exit `0` (`test_signal_handler_only_sets_the_stop_event`, `tests/unit/test_loop.py`; historical MANUAL M3 scenarios D, D2). `once`: no handler by design (`test_once_mode_installs_no_signal_handlers`, spec §8.3.3) | Init process for a `once` container running as PID 1 (N5); termination grace period long enough for an in-flight request |
+| 9 | Build once, deploy everywhere | MET | No environment-specific code paths; only env vars differ (`APP_ENV` affects logs only) | One image; CronJob with overlap/runtime controls (e.g. `concurrencyPolicy: Forbid`, `activeDeadlineSeconds`), because there is no circuit breaker (D11) |
+| 10 | Unique URL prefix | N/A (API-only, spec §2) | The simulator only calls `POST /api/v1/results` | – |
+| 11 | Swagger UI `/docs` | N/A (API-only, spec §2) | No HTTP server | – |
+
+## M4 verification
+
+The application implementation was reviewed and tested through commit `94cc3ae`. These README
+changes are documentation only.
+
+### Automated (offline, run by Claude Code, 2026-10-22)
+
+| Check | Result |
+|---|---|
+| `flake8` | no findings, exit 0 |
+| `pytest -m "not integration"` | **375 passed**, no warnings, exit 0 |
+
+### MANUAL (performed by Muhammad, 2026-10-22, local end-to-end run)
+
+Against the real Results API (`127.0.0.1:8001`) and the local PostgreSQL development database, with
+all standard upper- and lower-case proxy variables unset for this run:
+
+| Check | Result |
+|---|---|
+| `SIM_MODE=once`, `SIM_BATCH_SIZE=5`, `RESULTS_API_URL=http://127.0.0.1:8001` | 5 result lines; `Batch done: 5 sent \| 5 accepted \| 0 rejected \| 0 undelivered \| 5 PASS \| 0 FAIL`; exit `0` |
+| Stored by the Results API | `total` 28 → 33, ids 29–33, all `"source":"simulator"`; API log: 5 × `POST /api/v1/results … 201` |
+| Read by the Reporting API (as `evp_reader`) | `summary` total 5, passed 5, failed 0, `pass_rate_percent` 100.0; hour bucket `2026-10-22T09:00:00Z` 5/5/0 |
+
+The optional manual proxy check (an unusable `HTTP_PROXY` with and without `NO_PROXY`) was not
+performed; D10 is covered by the unit test named under [Tests](#tests).
+
+---
+
+## Known limitations and M4 traceability
+
+M4 findings are tracked in GitHub issue #3. IDs: `B#` = backlog item from issue #3, `N#` = new
+finding of the M4 audit, `D#` = M4 decision.
+
+### Resolved in M4 (Simulator)
+
+| ID | Finding | Resolution | Commit |
+|---|---|---|---|
+| D10 | The proxy behaviour relied on httpx's implicit `trust_env` default | `httpx.Client(trust_env=True)` explicitly, locked by a unit test (spec §8.3.2) | `94cc3ae` |
+
+Related change in the Results API (not a simulator finding): the post-commit read-back path that
+could answer a stored result with a `5xx`, which the simulator then retried, was removed there (N2,
+`99716dc`).
+
+### Accepted risks and trade-offs
+
+- **Residual duplicate risk (D1).** HTTP `5xx` is retried, so if the Results API's COMMIT succeeds
+  but its confirmation is lost, a retry can store the result twice. After-send transport failures
+  are not retried (see [Retry behaviour](#retry-behaviour)). Only request idempotency (not in
+  scope) would remove the case.
+- **No circuit breaker (D11).** A Results API outage makes a batch slow (see the figures under
+  [Retry behaviour](#retry-behaviour)); scheduling limits are platform work (below).
+- **Unlisted httpx errors (N9).** Transport errors outside both retry lists (e.g. `ProxyError`)
+  end the run with exit code `3` without a batch summary, as specified for unexpected errors.
+- **No signal handlers in `once` mode.** By design (spec §8.3.3): SIGTERM/SIGINT keep their default
+  behaviour.
+- **Configuration errors are plain text (N7).** The fail-fast message is printed before the log
+  format is known, so it is plain text even with `LOG_FORMAT=json`.
+
+### Deferred platform work (not implemented)
+
+- **PID 1 in containers (N5).** A `once` container needs an init process (e.g. `tini`,
+  `docker run --init` or Compose `init: true`, depending on the final design); see the PID 1 caveat
+  under [Running once](#running-once).
+- **`NO_PROXY` in the deployment (D10, deployment side).** If the platform injects a proxy and the
+  Results API must be reached directly, the container/Kubernetes configuration must set `NO_PROXY`.
+- **CronJob controls (D11, deployment side).** Prevent overlapping runs and bound the run time,
+  e.g. `concurrencyPolicy: Forbid` and `activeDeadlineSeconds`.
+- **Termination grace period.** It must allow an in-flight request to finish in `loop` mode
+  (spec §8.3.3); to be verified during the Docker/Kubernetes phase.
