@@ -209,7 +209,9 @@ def main() -> int:
     try:
         # One random generator and one HTTP client for the whole process.
         rng = random.Random(settings.sim_seed)  # None (unset) = random seed; 0 is a valid seed
-        with httpx.Client() as client:
+        # trust_env=True on purpose (spec §8.3.2): HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY
+        # decide proxying. httpx also uses SSL_CERT_FILE/SSL_CERT_DIR because of it.
+        with httpx.Client(trust_env=True) as client:
             if settings.sim_mode == "once":
                 # No signal handlers: SIGTERM/SIGINT keep their normal behaviour.
                 return run_once(client, settings, rng)
