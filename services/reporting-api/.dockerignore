@@ -1,0 +1,19 @@
+# Local Python environment and caches
+
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Development and Testing
+tests/
+requirements-dev.txt
+setup.cfg
+
+# Local configuration and secrets
+.env
+.env.*
+
+# Git metadata and documentation
+.git/
+README.md

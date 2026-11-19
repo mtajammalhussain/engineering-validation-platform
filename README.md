@@ -4,9 +4,11 @@ A DevOps and Cloud Engineering portfolio project that simulates a small engineer
 
 The main purpose of this project is not only to build the application, but to design and operate it using modern DevOps practices including containerisation, CI/CD, Kubernetes, Infrastructure as Code, monitoring, security, and disaster recovery.
 
-> **Project status:** Application services are currently being developed and hardened.
-> The Docker, Kubernetes, CI/CD, Terraform, monitoring, security and cloud deployment layers will be implemented progressively
-> as part of the DevOps Bootcamp.
+> **Project status:** Application development and Dockerization completed.
+>
+> Docker images are published to GitHub Container Registry (GHCR).
+> Development and production deployment, Kubernetes, CI/CD, Terraform,
+> monitoring and disaster recovery are being implemented progressively.
 
 ---
 
@@ -152,30 +154,40 @@ Separate development and production environments will be used, with automated de
 - Prometheus
 - Grafana
 - AWS
+- GitHub Container Registry (GHCR)
+- Trivy
 
 ---
+
 
 ## Current Project Status
 
 ### Implemented
 
-- Results API
-- Reporting API
-- Test Simulator
-- PostgreSQL schema and migrations
+- Results API, Reporting API and Test Simulator
+- PostgreSQL schema and Alembic migrations
 - Unit and integration tests
+- Dockerfiles and .dockerignore files for all three applications
+- Docker image builds and local functional testing
+- Trivy vulnerability scanning and Debian security updates
+- Multi-platform Docker images (AMD64 and ARM64) published to private GHCR packages
 
 ### In Progress
 
-- Application hardening
+- Development and production deployment configuration
+- Docker documentation and deployment instructions
 
 ### Planned
 
-- Dockerisation
-- CI/CD pipeline
+- Automated CI/CD pipeline with GitHub Actions
 - Kubernetes deployment
 - Terraform infrastructure
 - Monitoring with Prometheus and Grafana
-- Security scanning
-- Development and production environments
-- Disaster recovery strategy
+- Additional DevSecOps controls
+- Backup and disaster recovery strategy
+
+---
+
+## Documentation
+
+- [Dockerization Guide](docs/DOCKER.md)
