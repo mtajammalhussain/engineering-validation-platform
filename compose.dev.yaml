@@ -1,0 +1,79 @@
+name: evp-dev
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: evp
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      EVP_WRITER_PASSWORD: ${EVP_WRITER_PASSWORD:?Set EVP_WRITER_PASSWORD}
+      EVP_READER_PASSWORD: ${EVP_READER_PASSWORD:?Set EVP_READER_PASSWORD}
+
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d evp"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  results-api:
+    image: evp-results-api:patched
+    ports:
+      - "127.0.0.1:8011:8001"
+    environment:
+      PORT: "8001"
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: evp
+      DB_USER: evp_writer
+      DB_PASSWORD: ${EVP_WRITER_PASSWORD:?Set EVP_WRITER_PASSWORD}
+      RESULTS_API_KEY: ${RESULTS_API_KEY:?Set RESULTS_API_KEY}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  reporting-api:
+    image: evp-reporting-api:patched
+    ports:
+      - "127.0.0.1:8012:8002"
+    environment:
+      PORT: "8002"
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: evp
+      DB_USER: evp_reader
+      DB_PASSWORD: ${EVP_READER_PASSWORD:?Set EVP_READER_PASSWORD}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  simulator:
+    image: evp-simulator:patched
+    environment:
+      RESULTS_API_URL: http://results-api:8001
+      RESULTS_API_KEY: ${RESULTS_API_KEY:?Set RESULTS_API_KEY}
+      SIM_MODE: once
+      SIM_BATCH_SIZE: "3"
+      NO_PROXY: results-api,localhost,127.0.0.1
+    depends_on:
+      results-api:
+        condition: service_healthy
+    profiles:
+      - simulation
+
+volumes:
+  postgres_dev_data:
