@@ -171,11 +171,12 @@ Separate development and production environments will be used, with automated de
 - Docker image builds and local functional testing
 - Trivy vulnerability scanning and Debian security updates
 - Multi-platform Docker images (AMD64 and ARM64) published to private GHCR packages
+- Separate Docker Compose development and production-like environments
+- PostgreSQL health checks, database initialization and end-to-end testing
 
 ### In Progress
 
-- Development and production deployment configuration
-- Docker documentation and deployment instructions
+- Kubernetes and deployment documentation
 
 ### Planned
 
@@ -191,3 +192,4 @@ Separate development and production environments will be used, with automated de
 ## Documentation
 
 - [Dockerization Guide](docs/DOCKER.md)
+- [Development and Production Environments](docs/ENVIRONMENTS.md)

@@ -1,0 +1,82 @@
+name: evp-prod
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: evp
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${PROD_POSTGRES_PASSWORD:?Set PROD_POSTGRES_PASSWORD}
+      EVP_WRITER_PASSWORD: ${PROD_WRITER_PASSWORD:?Set PROD_WRITER_PASSWORD}
+      EVP_READER_PASSWORD: ${PROD_READER_PASSWORD:?Set PROD_READER_PASSWORD}
+
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d evp"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  results-api:
+    image: ghcr.io/mtajammalhussain/evp-results-api:multiarch-test
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8021:8001"
+    environment:
+      PORT: "8001"
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: evp
+      DB_USER: evp_writer
+      DB_PASSWORD: ${PROD_WRITER_PASSWORD:?Set PROD_WRITER_PASSWORD}
+      RESULTS_API_KEY: ${PROD_RESULTS_API_KEY:?Set PROD_RESULTS_API_KEY}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  reporting-api:
+    image: ghcr.io/mtajammalhussain/evp-reporting-api:multiarch-test
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8022:8002"
+    environment:
+      PORT: "8002"
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: evp
+      DB_USER: evp_reader
+      DB_PASSWORD: ${PROD_READER_PASSWORD:?Set PROD_READER_PASSWORD}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  simulator:
+    image: ghcr.io/mtajammalhussain/evp-simulator:multiarch-test
+    environment:
+      RESULTS_API_URL: http://results-api:8001
+      RESULTS_API_KEY: ${PROD_RESULTS_API_KEY:?Set PROD_RESULTS_API_KEY}
+      SIM_MODE: once
+      SIM_BATCH_SIZE: "3"
+      NO_PROXY: results-api,localhost,127.0.0.1
+    depends_on:
+      results-api:
+        condition: service_healthy
+    profiles:
+      - simulation
+
+volumes:
+  postgres_prod_data:
